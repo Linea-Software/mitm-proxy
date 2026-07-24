@@ -1,0 +1,47 @@
+[package]
+name = "mitm-proxy"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone man-in-the-middle proxy terminating HTTP/1.x, HTTP/2 and HTTP/3"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "mitm_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mitm-proxy"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1.91"
+bytes = "1.12.1"
+clap = { version = "4.6.4", features = ["derive"] }
+color-eyre = "0.6.5"
+eyre = "0.6.12"
+futures = "0.3.33"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1.4.2"
+http-body-util = "0.1.4"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["full"] }
+quinn = "0.11.11"
+rcgen = { version = "0.14.8", features = ["pem", "x509-parser"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2.2.0"
+rustls-pki-types = "1.15.1"
+thiserror = "2.0.19"
+time = "0.3.54"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+webpki-roots = "1.0.9"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+rcgen = { version = "0.14.8", features = ["pem", "x509-parser"] }
+tempfile = "3"
+x509-parser = "0.17"
