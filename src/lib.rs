@@ -57,8 +57,8 @@ pub use ca::CertAuthority;
 pub use config::ProxyConfig;
 pub use error::{ProxyError, Result};
 pub use inspect::{
-    ConnMeta, Inspectors, Protocol, RequestAction, RequestInspector, ResponseAction,
-    ResponseInspector,
+    BufferedRequest, BufferedResponse, ConnMeta, Inspectors, Protocol, RequestAction,
+    RequestInspector, ResponseAction, ResponseInspector,
 };
 
 use cert_resolver::DynamicCertResolver;
