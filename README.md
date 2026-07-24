@@ -135,4 +135,4 @@ HTTP/3 stream-FIN bug postmortem.
 
 ## License
 
-MIT OR Apache-2.0
+MIT

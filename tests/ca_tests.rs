@@ -3,7 +3,6 @@
 mod common;
 
 use common::*;
-use tempfile::TempDir;
 
 #[tokio::test]
 async fn first_run_generates_and_persists_ca() {
