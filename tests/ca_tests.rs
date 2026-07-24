@@ -3,7 +3,6 @@
 mod common;
 
 use common::*;
-use std::path::PathBuf;
 use tempfile::TempDir;
 
 #[tokio::test]

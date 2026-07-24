@@ -1,0 +1,268 @@
+# mitm-proxy — Full LLM Reference
+
+## Crate identity
+
+- **Package name:** `mitm-proxy` / `mitm_proxy` (lib)
+- **Edition:** 2024
+- **License:** MIT OR Apache-2.0
+- **Repo path:** `C:\Projects\ace-project\mitm-proxy` (standalone crate, NOT a workspace member)
+
+## Build & test
+
+```bash
+cargo build                # debug
+cargo build --release
+cargo test                 # 71 hermetic tests, no network
+cargo clippy --all-targets
+cargo fmt
+```
+
+**Windows quirk:** running `mitm-proxy.exe` locks `target/debug/mitm-proxy.exe`. Kill it before rebuilding:
+```bash
+taskkill //F //IM mitm-proxy.exe   # git-bash
+Stop-Process -Name mitm-proxy -Force  # PowerShell
+```
+
+---
+
+## Source layout
+
+| Path | Visibility | Dependencies | Role |
+|------|-----------|-------------|------|
+| `src/lib.rs` | `pub` | all modules | `MitmProxy` builder — `new(config)`, `with_request_inspector`, `with_response_inspector`, `with_inspectors`, `run()`. Installs ring crypto, wires CA → cert resolver → TLS configs → state → listeners. |
+| `src/main.rs` | binary | `clap`, `color-eyre`, `tracing-subscriber` | CLI entry. Args: `--listen <addr>` (default 127.0.0.1:8080), `--http3 <addr>`, `--ca-dir <dir>` (default `./mitm-ca`), `--install-ca`, `--insecure-upstream`. Uses `LoggingInspector`. |
+| `src/config.rs` | `pub` | — | `ProxyConfig` — `listen_addr: SocketAddr`, `http3_addr: Option<SocketAddr>`, `ca_cert_path/ca_key_path: PathBuf`, `install_ca: bool`, `verify_upstream: bool`. Builder methods: `new(addr, ca_dir)`, `with_http3(addr)`, `install_ca(bool)`, `verify_upstream(bool)`. |
+| `src/error.rs` | `pub` | `eyre`, `thiserror` | `type Result<T> = eyre::Result<T>`. `ProxyError` enum: `Bind { addr, source }`, `ClientHandshake(String)`, `Upstream { authority, source }`, `MissingAuthority`. |
+| `src/inspect.rs` | `pub` | `async-trait`, `http`, `bytes` | `Protocol::{Http1,Http2,Http3}` with Display. `ConnMeta { client_addr, protocol, is_tls, authority }`. `BufferedRequest = Request<Bytes>`, `BufferedResponse = Response<Bytes>`. `RequestAction::{Continue, Respond(BufferedResponse)}`, `ResponseAction::Continue`. `RequestInspector` trait: `inspect_request(&self, &ConnMeta, &mut BufferedRequest) -> RequestAction`. `ResponseInspector` trait: `inspect_response(&self, &ConnMeta, &request::Parts, &mut BufferedResponse) -> ResponseAction`. `Inspectors { request: Arc<dyn RequestInspector>, response: Arc<dyn ResponseInspector> }` with Default (noop), `new(req, resp)`. `NoopInspector`, `LoggingInspector` (logs at INFO). |
+| `src/ca.rs` | `pub` | `rcgen`, `rustls-pemfile`, `rustls-pki-types`, `time` | `CertAuthority { issuer, cert_der, cert_pem }`. Methods: `load_or_generate(cert_path, key_path)`, `from_pem(cert_pem, key_pem)`, `generate_root() -> (cert_pem, key_pem)`, `issue_leaf(host) -> (Chain, PrivateKeyDer)`, `install_to_trust_store(cert_path)`. Root CA: 20y, BasicConstraints=CA, KeyCertSign+CRLSign+DigitalSignature. Leaf: 365d, NoCa, ServerAuth EKU, AKI matching CA's SKI, SAN=DNS or IP. |
+| `src/cert_resolver.rs` | `mod` | `rustls`, `std::collections::HashMap` | `DynamicCertResolver { ca: Arc<CertAuthority>, cache: Mutex<HashMap<String, Arc<CertifiedKey>>> }`. Implements `ResolvesServerCert`. `resolve(client_hello)` — uses SNI or falls back to "localhost". `certified_key(host)` — mint + cache or return cached. |
+| `src/tls.rs` | `mod` | `rustls`, `webpki-roots` | `TCP_ALPN = [b"h2", b"http/1.1"]`, `H3_ALPN = [b"h3"]`. `server_config(resolver, alpn)` — builds `Arc<ServerConfig>` with dynamic resolver. `client_config(verify, alpn)` — builds `Arc<ClientConfig>` with webpki roots or `NoVerify` (dangerous) verifier. |
+| `src/upstream.rs` | `mod` | `hyper`, `http`, `tokio-rustls` | `Upstream { tls: Arc<ClientConfig> }`. `send(secure, host, port, Request<Full<Bytes>>) -> Result<Response<Bytes>>` — opens TCP, optionally TLS, does hyper `http1`/`http2` handshake by ALPN, buffered response. No connection pooling. |
+| `src/http.rs` | `mod` | `hyper`, `hyper-util`, `tokio-rustls` | `serve(SharedState)` — binds TCP listener, loops accepting connections. `serve_connection` — HTTP/1.1 with upgrades, dispatches to `outer_handler`. `outer_handler` — CONNECT → `mitm_tunnel`, else → `forward_plaintext`. `mitm_tunnel` — terminates TLS, serves decrypted stream via `auto::Builder`. `relay` — buffer body → inspect_request → forward upstream → inspect_response → into_full. |
+| `src/http3.rs` | `mod` | `quinn`, `h3`, `h3-quinn`, `bytes` | `serve(SharedState, SocketAddr)` — binds QUIC endpoint, accepts connections. `serve_connection` — h3 handshake with `.send_grease(false)`, loops on `accept()` → spawns per-stream task. `handle_request` — drain body → inspect_request → forward upstream → inspect_response → `send_response`. `send_response` — head + data + finish. GREASE disabled. |
+| `src/state.rs` | `mod` | — | `ProxyState { server_tls, h3_tls, upstream, inspectors, config }`. `SharedState = Arc<ProxyState>`. |
+| `src/util.rs` | `mod` | `http`, `http-body-util` | `authority_display(host, port, secure)` — omits default ports (443/80). `absolute_uri(uri, host, port, secure)` — upgrades origin-form to absolute. `snapshot_request_head(parts)` — clones method/uri/version/headers. `ensure_host_header(req, host, port, secure)` — sets Host for h1. `strip_hop_by_hop(headers)` — removes 9 hop-by-hop header names. |
+
+---
+
+## Public API surface
+
+### `MitmProxy` (lib.rs)
+
+```rust
+impl MitmProxy {
+    pub fn new(config: ProxyConfig) -> Self;
+    pub fn with_request_inspector(mut self, inspector: Arc<dyn RequestInspector>) -> Self;
+    pub fn with_response_inspector(mut self, inspector: Arc<dyn ResponseInspector>) -> Self;
+    pub fn with_inspectors(mut self, inspectors: Inspectors) -> Self;
+    pub async fn run(self) -> Result<()>;
+}
+```
+
+### Re-exports from `lib.rs`
+
+```rust
+pub use ca::CertAuthority;
+pub use config::ProxyConfig;
+pub use error::{ProxyError, Result};
+pub use inspect::{
+    ConnMeta, Inspectors, Protocol, RequestAction, RequestInspector, ResponseAction, ResponseInspector,
+};
+pub fn noop_inspector() -> Arc<NoopInspector>;
+```
+
+---
+
+## Data flow
+
+### HTTP/1.x plaintext forward
+
+```
+Client ── GET http://host/path HTTP/1.1 ──→ http::serve
+  → serve_connection (http1 with_upgrades)
+    → outer_handler → forward_plaintext
+      → relay:
+        1. absolute_uri (origin-form → absolute)
+        2. buffer body (Incoming → Bytes)
+        3. inspect_request (Continue / Respond)
+        4. snapshot_request_head
+        5. strip_hop_by_hop
+        6. ensure_host_header (Host for h1)
+        7. upstream.send(false, host, 80, req)
+        8. inspect_response
+        9. into_full (remove TE/CL, wrap in Full)
+```
+
+### HTTP/1.1 CONNECT → MITM tunnel
+
+```
+Client ── CONNECT host:443 HTTP/1.1 ──→ http::serve
+  → outer_handler
+    → 200 response (immediate, body empty)
+    → hyper::upgrade::on(req)
+      → mitm_tunnel(upgraded, authority, peer, state)
+        → TlsAcceptor::accept → TLS handshake (per-host cert)
+        → ALPN: h2 → Protocol::Http2, else Http1
+        → auto::Builder.serve_connection (h2 or http/1.1)
+          → relay (same pipeline as above, secure=true)
+```
+
+### HTTP/3 (QUIC)
+
+```
+Client ── QUIC + h3 ──→ http3::serve
+  → quinn endpoint accept → serve_connection
+    → h3::server::builder().send_grease(false).build(...)
+    → loop: h3_conn.accept() → resolve_request()
+      → handle_request(req, stream, peer, state):
+        1. drain body (recv_data loop)
+        2. inspect_request
+        3. ensure_host_header (h3 → skip)
+        4. upstream.send(true, host, port, req)  // always HTTPS
+        5. inspect_response
+        6. send_response (head → data → finish)
+```
+
+---
+
+## HTTP/3 stream-FIN bug — reference
+
+**Symptom (aioquic):** Client receives `HeadersReceived` + `DataReceived`
+(the body bytes arrive), but the QUIC stream FIN (`stream_ended = True`) is
+never received. Client hangs → times out → sends `ApplicationClose 0x0`.
+
+**Root cause:** `h3 = 0.0.8` writes a GREASE frame on the first request
+stream per connection during `finish()`. aioquic mis-handles the GREASE-frames-
+before-FIN sequence.
+
+**Fix:** `src/http3.rs:68` — `.send_grease(false)` on the h3 connection
+builder. This disables GREASE frames entirely.
+
+**Verified by:** `tests/proxy_http3.rs::http3_stream_finishes_cleanly` — 3
+consecutive GET requests over one h3 connection, all complete with clean
+stream FINs.
+
+**Canonical test client:** Rust in-process h3 client (`h3` + `h3-quinn` +
+`quinn`). No dependency on aioquic for testing.
+
+---
+
+## Test suite
+
+All 71 tests are **hermetic** — local echo servers on `127.0.0.1:0`, no
+internet. Proxy runs in-process via the library API (`MitmProxy::new()`).
+
+### Unit tests (45, in src/)
+
+| Module | Tests | Key assertions |
+|--------|-------|---------------|
+| `config` | 4 | Default port 8080, h3 default None, builder chain, CA paths |
+| `error` | 4 | Each ProxyError variant displays correctly |
+| `inspect` | 7 | Noop returns Continue, custom inspector blocks with Respond, mutations visible, Protocol display, ConnMeta, Inspectors default is noop |
+| `ca` | 10 | Root: parseable, SKI present, BasicConstraints CA. Leaf: CN+SAN match host, IP SAN, AKI present, AKI value equals CA SKI, validity ≤398d, **cryptographic signature verified**, load_or_generate persists/reuses |
+| `cert_resolver` | 4 | Returns cert for SNI, same Arc on repeat, IP SNI works, separate hosts = separate cache |
+| `tls` | 5 | TCP ALPN has h2+http1.1, H3 ALPN has h3, client config verify=true/false, ALPN set |
+| `util` | 11 | authority_display, absolute_uri upgrade/passthrough, snapshot clones all fields, strip removes 9 headers, ensure_host_header for h1/skip h2/h3 |
+
+### Integration tests (26, in tests/)
+
+| File | Tests | What it covers |
+|------|-------|----------------|
+| `ca_tests.rs` | 3 | First-run generation, second-run reuse, leaf cache reuse |
+| `cli_tests.rs` | 8 | `--help`/`--version`, `--listen`, `--http3`, `--ca-dir`, `--insecure-upstream`, starts without `--install-ca`, defaults shown |
+| `inspector_tests.rs` | 4 | Observer counts calls, request header mutation, response body mutation, `RequestAction::Respond` blocks upstream |
+| `proxy_http1.rs` | 4 | Plaintext forward, CONNECT GET, CONNECT POST body, custom header reach origin |
+| `proxy_http2.rs` | 3 | CONNECT → h2 GET, POST body, **2 concurrent multiplexed streams on one h2 connection** |
+| `proxy_http3.rs` | 3 | h3 GET, h3 POST, **3 consecutive GETs with clean stream FIN** |
+
+### Test helpers (tests/common/mod.rs)
+
+- `init_tracing()` — single-init tracing subscriber
+- `start_proxy_on(tcp_addr, h3_addr, ca_dir, inspectors) → (ca_pem, JoinHandle)`
+- `pick_tcp_addr() → SocketAddr` — ephemeral TCP port
+- `pick_udp_addr() → SocketAddr` — ephemeral UDP port
+- `spawn_http1_origin() → SocketAddr` — HTTP/1.1 echo server
+- `spawn_https_origin() → (SocketAddr, SelfSignedCert)` — TLS echo server
+- `proxy_plaintext_get(proxy_addr, url) → (Status, body)` — via plaintext HTTP/1.1
+- `proxy_connect_get(proxy_addr, ca_pem, host, port, path) → (Status, body)` — CONNECT + TLS + HTTP/1.1 GET
+- `proxy_connect_post(proxy_addr, ca_pem, host, port, path, body, headers) → (Status, body)` — CONNECT + TLS + HTTP/1.1 POST
+
+### CLI tests (tests/cli_tests.rs)
+
+Launch the compiled binary (`assert_cmd::Command::cargo_bin("mitm-proxy")`)
+and verify:
+- Flag parsing (help, version)
+- Port binding (TcpStream::connect_timeout)
+- CA file creation on disk
+- Flag acceptance (http3, insecure-upstream, install-ca not required)
+
+---
+
+## H3 test client architecture
+
+The h3 tests use a Rust in-process client:
+
+```rust
+fn h3_client_config(ca_pem: &str) -> rustls::ClientConfig {
+    // builds config with root = CA PEM, ALPN = [b"h3"]
+}
+
+async fn h3_get(proxy_h3_addr, ca_pem, target_host, target_port, path) -> (Status, body) {
+    // 1. Create quinn endpoint
+    // 2. Connect (QUIC) to proxy_h3_addr with SNI = target_host
+    // 3. h3::client::new(connection)
+    // 4. Send GET request with absolute-form URI (https://host:port/path)
+    // 5. recv_response → recv_data loop → recv_trailers (assert None)
+    // 6. Return (status, body string)
+}
+```
+
+Key: ALPN must be set to `[b"h3"]` on the rustls `ClientConfig` or the
+QUIC handshake fails with "peer doesn't support any known protocol".
+
+---
+
+## Key dependency versions
+
+| Crate | Version | Notes |
+|-------|---------|-------|
+| `h3` | 0.0.8 | HTTP/3 protocol — GREASE frames disabled |
+| `h3-quinn` | 0.0.10 | h3 transport layer over quinn |
+| `quinn` | 0.11.11 | QUIC transport (client/server) |
+| `rustls` | 0.23.42 | features: ring, logging, std, tls12 |
+| `rcgen` | 0.14.8 | features: pem, x509-parser |
+| `hyper` | 1 | features: full |
+| `hyper-util` | 0.1.20 | features: full — auto builder |
+| `tokio-rustls` | 0.26.4 | features: ring, logging, tls12 |
+| `x509-parser` | 0.17 (dev) | features: verify |
+| `tokio` | 1.53.1 | features: full |
+| `assert_cmd` | 2.0 (dev) | CLI binary testing |
+| `tempfile` | 3 (dev) | TempDir for CA dirs |
+
+---
+
+## CA certificate details
+
+| Property | Root CA | Leaf |
+|----------|---------|------|
+| Validity | now-1d .. now+20y | now-1d .. now+365d |
+| BasicConstraints | CA, Unconstrained | NoCa |
+| KeyUsage | KeyCertSign, CRLSign, DigitalSignature | DigitalSignature, KeyEncipherment |
+| ExtendedKeyUsage | — | ServerAuth |
+| SKI / AKI | SKI present (auto by rcgen) | AKI present, value = CA's SKI |
+| Subject | `CN=mitm-proxy Root CA, O=mitm-proxy` | `CN=<host>` |
+| SAN | — | DnsName or IpAddress matching host |
+| Signing key | Generated once, persisted to `{ca_dir}/mitm_ca.key` | Generated per-request, ephemeral |
+
+The CA keypair is persisted to disk and reused across restarts. Leaves are
+cached by SNI in `DynamicCertResolver`'s `HashMap` under a `Mutex`.
+
+---
+
+## Environment notes (Windows)
+
+- **Rust:** 1.97.1
+- **Shell:** git-bash (primary POSIX), PowerShell available
+- **curl:** schannel build — `--cacert <pem>` ignored, `--http2` unsupported, `-k` works
+- **openssl:** mingw build — `s_client -CAfile <pem>` works, `-proxy` for CONNECT
+- **Python:** uv cpython 3.14 with httpx[http2] and aioquic

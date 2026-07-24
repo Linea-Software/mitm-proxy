@@ -58,13 +58,14 @@ impl Upstream {
             let connector = TlsConnector::from(self.tls.clone());
             let server_name = ServerName::try_from(host.to_string())
                 .map_err(|e| eyre!("invalid upstream server name {host:?}: {e}"))?;
-            let tls = connector
-                .connect(server_name, tcp)
-                .await
-                .map_err(|e| ProxyError::Upstream {
-                    authority: authority.clone(),
-                    source: eyre!("tls handshake: {e}"),
-                })?;
+            let tls =
+                connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| ProxyError::Upstream {
+                        authority: authority.clone(),
+                        source: eyre!("tls handshake: {e}"),
+                    })?;
 
             let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
             debug!(

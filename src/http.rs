@@ -116,7 +116,10 @@ async fn forward_plaintext(
 ) -> Response<Full<Bytes>> {
     let uri = req.uri().clone();
     let Some(host) = uri.host().map(str::to_owned) else {
-        return simple(StatusCode::BAD_REQUEST, "expected absolute-form request URI");
+        return simple(
+            StatusCode::BAD_REQUEST,
+            "expected absolute-form request URI",
+        );
     };
     let port = uri.port_u16().unwrap_or(80);
 
@@ -202,7 +205,12 @@ async fn relay(
     parts.uri = abs_uri;
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
-        Err(e) => return simple(StatusCode::BAD_REQUEST, &format!("reading request body: {e}")),
+        Err(e) => {
+            return simple(
+                StatusCode::BAD_REQUEST,
+                &format!("reading request body: {e}"),
+            );
+        }
     };
     let mut buffered = Request::from_parts(parts, body_bytes);
 

@@ -23,6 +23,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing_subscriber::EnvFilter;
 
 // ----- re-exports for test files -----
+#[allow(unused_imports)]
 pub use mitm_proxy::inspect::{
     Inspectors, NoopInspector, RequestAction, RequestInspector, ResponseAction, ResponseInspector,
 };
@@ -81,6 +82,7 @@ pub async fn pick_tcp_addr() -> SocketAddr {
 }
 
 /// Bind a UDP socket to get an ephemeral port for QUIC.
+#[allow(dead_code)]
 pub fn pick_udp_addr() -> SocketAddr {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = socket.local_addr().unwrap();
@@ -166,6 +168,7 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
 // HTTP/1.1 plaintext origin
 // =========================================================================
 
+#[allow(dead_code)]
 pub async fn spawn_http1_origin() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -227,6 +230,7 @@ pub async fn spawn_https_origin() -> (SocketAddr, SelfSignedCert) {
 // =========================================================================
 
 /// Plaintext GET through the proxy.
+#[allow(dead_code)]
 pub async fn proxy_plaintext_get(proxy_addr: SocketAddr, target_url: &str) -> (StatusCode, String) {
     let stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
     let io = TokioIo::new(stream);
@@ -246,6 +250,7 @@ pub async fn proxy_plaintext_get(proxy_addr: SocketAddr, target_url: &str) -> (S
 }
 
 /// CONNECT + TLS request through the proxy, trusting the proxy CA.
+#[allow(dead_code)]
 pub async fn proxy_connect_get(
     proxy_addr: SocketAddr,
     ca_pem: &str,
@@ -326,6 +331,7 @@ pub async fn proxy_connect_get(
 }
 
 /// POST body through the CONNECT proxy, return status + body.
+#[allow(dead_code)]
 pub async fn proxy_connect_post(
     proxy_addr: SocketAddr,
     ca_pem: &str,

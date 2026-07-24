@@ -44,4 +44,4 @@ assert_cmd = "2.0"
 predicates = "3.1"
 rcgen = { version = "0.14.8", features = ["pem", "x509-parser"] }
 tempfile = "3"
-x509-parser = "0.17"
+x509-parser = { version = "0.17", features = ["verify"] }

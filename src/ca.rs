@@ -189,12 +189,6 @@ impl CertAuthority {
         );
         Ok(())
     }
-
-    /// Raw access to the issuer for tests that need to verify signatures.
-    #[cfg(test)]
-    pub(crate) fn issuer(&self) -> &Issuer<'static, KeyPair> {
-        &self.issuer
-    }
 }
 
 #[cfg(test)]
@@ -258,6 +252,68 @@ mod tests {
             .iter()
             .any(|e| e.oid == x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME);
         assert!(has_san, "leaf must have SAN");
+    }
+
+    #[test]
+    fn leaf_aki_matches_ca_ski() {
+        use x509_parser::extensions::ParsedExtension;
+
+        let (cert_pem, key_pem) = CertAuthority::generate_root().unwrap();
+        let ca = CertAuthority::from_pem(cert_pem, &key_pem).unwrap();
+
+        let (chain, _) = ca.issue_leaf("example.com").unwrap();
+        let ca_parsed = parse_der(ca.cert_der.as_ref());
+        let leaf_parsed = parse_der(chain[0].as_ref());
+
+        // Extract CA's Subject Key Identifier value
+        let ca_ski_ext = ca_parsed
+            .extensions()
+            .iter()
+            .find(|e| e.oid == x509_parser::oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER)
+            .expect("CA must have SKI extension");
+        let ski_key_id = match ca_ski_ext.parsed_extension() {
+            ParsedExtension::SubjectKeyIdentifier(ski) => ski.0.to_vec(),
+            _ => panic!("expected SubjectKeyIdentifier extension"),
+        };
+
+        // Extract leaf's Authority Key Identifier value
+        let leaf_aki_ext = leaf_parsed
+            .extensions()
+            .iter()
+            .find(|e| e.oid == x509_parser::oid_registry::OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER)
+            .expect("leaf must have AKI extension");
+        let aki_key_id = match leaf_aki_ext.parsed_extension() {
+            ParsedExtension::AuthorityKeyIdentifier(aki) => aki
+                .key_identifier
+                .as_ref()
+                .expect("AKI must contain key_identifier")
+                .0
+                .to_vec(),
+            _ => panic!("expected AuthorityKeyIdentifier extension"),
+        };
+
+        assert_eq!(
+            ski_key_id, aki_key_id,
+            "leaf AKI key identifier must match CA SKI key identifier"
+        );
+    }
+
+    #[test]
+    fn leaf_signature_verified_by_ca() {
+        let (cert_pem, key_pem) = CertAuthority::generate_root().unwrap();
+        let ca = CertAuthority::from_pem(cert_pem, &key_pem).unwrap();
+
+        let (chain, _leaf_key) = ca.issue_leaf("example.com").unwrap();
+
+        let ca_parsed = parse_der(ca.cert_der.as_ref());
+        let leaf_parsed = parse_der(chain[0].as_ref());
+
+        // Verify the leaf certificate's signature cryptographically using the
+        // CA's public key. This proves the CA actually signed the leaf.
+        let ca_spki = ca_parsed.public_key();
+        leaf_parsed
+            .verify_signature(Some(ca_spki))
+            .expect("leaf signature must be valid against CA public key");
     }
 
     #[test]

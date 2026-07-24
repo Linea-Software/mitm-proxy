@@ -10,7 +10,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::Arc;
 use tempfile::TempDir;
 
-/// Helper: do a CONNECT tunnel, then make multiple h2 requests on the same connection.
+/// Helper: do a CONNECT tunnel (raw TCP), then make multiple h2 requests on
+/// the same TLS connection.
 async fn h2_multiplexed_requests(
     proxy_addr: std::net::SocketAddr,
     ca_pem: &str,
@@ -21,38 +22,54 @@ async fn h2_multiplexed_requests(
     for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|r| r.ok()) {
         roots.add(cert).unwrap();
     }
-    let tls_cfg = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
+    let mut tls_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let tls_cfg = Arc::new(tls_cfg);
 
-    let tcp = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
-    let io = TokioIo::new(tcp);
+    // Raw CONNECT — write the request, read the 200, then upgrade to TLS.
+    let mut tcp = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    tcp.set_nodelay(true).ok();
 
-    let connect_req = Request::builder()
-        .method("CONNECT")
-        .uri(format!("{host}:{port}"))
-        .body(Full::new(Bytes::new()))
+    let connect_bytes = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, connect_bytes.as_bytes())
+        .await
         .unwrap();
 
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
-    tokio::spawn(async {
-        let _ = conn.await;
-    });
-    let resp = sender.send_request(connect_req).await.unwrap();
-    assert_eq!(resp.status(), 200);
+    // Read response until double CRLF
+    let mut buf = [0u8; 4096];
+    use tokio::io::AsyncReadExt;
+    let mut total = 0;
+    let mut found_end = false;
+    while total < buf.len() {
+        let n = tcp.read(&mut buf[total..total + 1]).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        total += n;
+        if total >= 4 && &buf[total - 4..total] == b"\r\n\r\n" {
+            found_end = true;
+            break;
+        }
+    }
+    assert!(found_end, "CONNECT response must end with double CRLF");
+    let response_head = String::from_utf8_lossy(&buf[..total]);
+    assert!(
+        response_head.contains("200"),
+        "CONNECT must return 200, got: {response_head}"
+    );
 
-    let upgraded = hyper::upgrade::on(resp).await.unwrap();
     let tls_stream = tokio_rustls::TlsConnector::from(tls_cfg)
         .connect(
             rustls::pki_types::ServerName::try_from(host.to_string()).unwrap(),
-            TokioIo::new(upgraded),
+            tcp,
         )
         .await
         .unwrap();
 
-    let (tls_stream, tls_state) = tls_stream.into_inner();
+    // Verify ALPN via the TLS session state without consuming the stream.
+    let (_, tls_state) = tls_stream.get_ref();
     assert_eq!(
         tls_state.alpn_protocol(),
         Some(b"h2".as_slice()),
