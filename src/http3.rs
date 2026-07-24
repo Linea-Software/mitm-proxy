@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 use crate::error::Result;
 use crate::inspect::{ConnMeta, Protocol, RequestAction};
 use crate::state::SharedState;
-use crate::util::{ensure_host_header, snapshot_request_head, strip_hop_by_hop};
+use crate::util::{absolute_uri, ensure_host_header, snapshot_request_head, strip_hop_by_hop};
 
 /// The h3 request stream type over a quinn connection, carrying `Bytes` bodies.
 type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -138,6 +138,15 @@ async fn handle_request(
     };
 
     let mut buffered = Request::from_parts(parts, body);
+
+    // Rebuild an absolute target URI to match TCP path behaviour inside the
+    // tunnel — origin-form URIs from HTTP/3 pseudo-headers may lack
+    // scheme/authority depending on the h3 library version.
+    let abs_uri = absolute_uri(buffered.uri(), &host, port, true)
+        .map_err(|e| eyre::eyre!("bad h3 request URI: {e}"))?;
+    let (mut new_parts, new_body) = buffered.into_parts();
+    new_parts.uri = abs_uri;
+    buffered = Request::from_parts(new_parts, new_body);
 
     // --- request inspect hook -------------------------------------------
     match state
