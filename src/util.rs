@@ -100,6 +100,10 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
         "upgrade",
         "proxy-authenticate",
         "proxy-authorization",
+        // `alt-svc` would tell clients to retry over QUIC/H3 on a path that is
+        // not available through the proxy (UDP is dropped upstream, forcing a
+        // TCP fallback), so it must not be forwarded.
+        "alt-svc",
     ];
     for name in HOP {
         headers.remove(*name);
@@ -190,6 +194,7 @@ mod tests {
         headers.insert("proxy-connection", "keep-alive".parse().unwrap());
         headers.insert("proxy-authenticate", "Basic".parse().unwrap());
         headers.insert("proxy-authorization", "Basic xxx".parse().unwrap());
+        headers.insert("alt-svc", "h3=\":443\"; ma=86400".parse().unwrap());
         headers.insert("content-type", "text/plain".parse().unwrap()); // end-to-end
 
         strip_hop_by_hop(&mut headers);
@@ -199,6 +204,7 @@ mod tests {
         assert!(headers.contains_key("content-type"));
         assert!(!headers.contains_key("connection"));
         assert!(!headers.contains_key("transfer-encoding"));
+        assert!(!headers.contains_key("alt-svc"));
     }
 
     // ---- is_ip_literal ----

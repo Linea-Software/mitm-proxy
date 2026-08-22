@@ -72,8 +72,15 @@ impl DynamicCertResolver {
 
     /// Expose the cache size for testing.
     #[cfg(test)]
-    fn cache_len(&self) -> usize {
+    pub(crate) fn cache_len(&self) -> usize {
         self.cache.lock().unwrap().len()
+    }
+
+    /// Whether a leaf certificate is cached for `host`. Test-only: used to
+    /// assert that tunneled (non-intercepted) hosts never get a cert minted.
+    #[cfg(test)]
+    pub(crate) fn has_cached_key(&self, host: &str) -> bool {
+        self.cache.lock().unwrap().contains_key(host)
     }
 }
 

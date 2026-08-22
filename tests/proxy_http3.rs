@@ -9,7 +9,8 @@ use bytes::Buf;
 use bytes::Bytes;
 use common::*;
 use futures::future;
-use http::{Request, StatusCode};
+use http::{Request, Response, StatusCode};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -33,6 +34,20 @@ async fn h3_get(
     target_port: u16,
     path: &str,
 ) -> (StatusCode, String) {
+    let (status, _, body) =
+        h3_get_full(proxy_h3_addr, ca_pem, target_host, target_port, path).await;
+    (status, body)
+}
+
+/// Like [`h3_get`], but also returns the response header map so tests can
+/// assert on stripped headers.
+async fn h3_get_full(
+    proxy_h3_addr: std::net::SocketAddr,
+    ca_pem: &str,
+    target_host: &str,
+    target_port: u16,
+    path: &str,
+) -> (StatusCode, http::HeaderMap, String) {
     let tls_cfg = h3_client_config(ca_pem);
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls_cfg)).unwrap();
 
@@ -69,6 +84,7 @@ async fn h3_get(
 
     let resp = stream.recv_response().await.unwrap();
     let status = resp.status();
+    let headers = resp.headers().clone();
     let mut body = Vec::new();
     while let Some(chunk) = stream.recv_data().await.unwrap() {
         body.extend_from_slice(chunk.chunk());
@@ -80,7 +96,59 @@ async fn h3_get(
     drop(send_request);
     drive_handle.await.unwrap();
 
-    (status, String::from_utf8_lossy(&body).to_string())
+    (status, headers, String::from_utf8_lossy(&body).to_string())
+}
+
+/// Spawn an HTTPS origin whose responses advertise `alt-svc` (the way real
+/// servers tell clients to retry over QUIC/H3).
+async fn spawn_alt_svc_origin() -> SocketAddr {
+    use std::convert::Infallible;
+
+    use http_body_util::Full;
+    use hyper::body::Incoming;
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    let cert = self_signed_cert();
+    let tls_cfg = tls_server_config(&cert);
+    let acceptor = TlsAcceptor::from(tls_cfg);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let a = acceptor.clone();
+            tokio::spawn(async move {
+                let tls = match a.accept(stream).await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                let io = TokioIo::new(tls);
+                let svc = service_fn(|_req: Request<Incoming>| async {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("alt-svc", "h3=\":443\"; ma=86400")
+                            .body(Full::new(Bytes::from("alt-svc-test")))
+                            .unwrap(),
+                    )
+                });
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+
+    addr
 }
 
 async fn h3_post(
@@ -232,4 +300,28 @@ async fn http3_stream_finishes_cleanly() {
         assert_eq!(status, 200);
         assert!(body.contains(&format!("?seq={i}")));
     }
+}
+
+#[tokio::test]
+async fn http3_strips_alt_svc_header() {
+    init_tracing();
+
+    let origin = spawn_alt_svc_origin().await;
+    let ca_dir = TempDir::new().unwrap();
+    let tcp_addr = pick_tcp_addr().await;
+    let h3_addr = pick_udp_addr();
+
+    let inspectors = Inspectors::default();
+    let (ca_pem, _handle) =
+        start_proxy_on(tcp_addr, Some(h3_addr), ca_dir.path(), inspectors).await;
+
+    let (status, headers, body) =
+        h3_get_full(h3_addr, &ca_pem, "localhost", origin.port(), "/").await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body, "alt-svc-test");
+    assert!(
+        !headers.contains_key("alt-svc"),
+        "alt-svc must not be forwarded to the client over H3"
+    );
 }

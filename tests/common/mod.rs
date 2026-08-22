@@ -27,7 +27,7 @@ use tracing_subscriber::EnvFilter;
 pub use mitm_proxy::inspect::{
     Inspectors, NoopInspector, RequestAction, RequestInspector, ResponseAction, ResponseInspector,
 };
-pub use mitm_proxy::{MitmProxy, ProxyConfig};
+pub use mitm_proxy::{InterceptDecider, MitmProxy, ProxyConfig};
 
 // ----- single tracing init -----
 static TRACING_INIT: std::sync::Once = std::sync::Once::new();
@@ -50,18 +50,42 @@ pub fn init_tracing() {
 
 /// Start a proxy on a **fixed** TCP address (and optional h3 address).
 /// Returns the addresses, CA PEM, and a join handle.  Drop the handle to stop.
+///
+/// Uses an intercept-all decider so CONNECT tests keep exercising the MITM
+/// path (the library default is to intercept nothing).
+#[allow(dead_code)]
 pub async fn start_proxy_on(
     tcp_addr: SocketAddr,
     h3_addr: Option<SocketAddr>,
     ca_dir: &std::path::Path,
     inspectors: Inspectors,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    start_proxy_on_with_decider(
+        tcp_addr,
+        h3_addr,
+        ca_dir,
+        inspectors,
+        Arc::new(InterceptAll),
+    )
+    .await
+}
+
+/// Like [`start_proxy_on`], but with an explicit interception decider.
+pub async fn start_proxy_on_with_decider(
+    tcp_addr: SocketAddr,
+    h3_addr: Option<SocketAddr>,
+    ca_dir: &std::path::Path,
+    inspectors: Inspectors,
+    decider: Arc<dyn InterceptDecider>,
+) -> (String, tokio::task::JoinHandle<()>) {
     let mut config = ProxyConfig::new(tcp_addr, ca_dir.to_path_buf()).verify_upstream(false);
     if let Some(addr) = h3_addr {
         config = config.with_http3(addr);
     }
 
-    let proxy = MitmProxy::new(config.clone()).with_inspectors(inspectors);
+    let proxy = MitmProxy::new(config.clone())
+        .with_inspectors(inspectors)
+        .with_intercept_decider(decider);
     let handle = tokio::spawn(async move {
         let _ = proxy.run().await;
     });
@@ -70,6 +94,28 @@ pub async fn start_proxy_on(
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let ca_pem = std::fs::read_to_string(&config.ca_cert_path).unwrap_or_default();
     (ca_pem, handle)
+}
+
+/// Decider that intercepts every tunnel — the pre-narrow-interception
+/// behaviour, kept for the existing CONNECT tests.
+#[derive(Debug, Default)]
+pub struct InterceptAll;
+
+impl InterceptDecider for InterceptAll {
+    fn should_intercept(&self, _authority: &http::uri::Authority, _sni: Option<&str>) -> bool {
+        true
+    }
+}
+
+/// Decider that tunnels every connection opaquely (intercepts nothing).
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct TunnelAll;
+
+impl InterceptDecider for TunnelAll {
+    fn should_intercept(&self, _authority: &http::uri::Authority, _sni: Option<&str>) -> bool {
+        false
+    }
 }
 
 /// Bind a TCP listener to get an ephemeral port, then return the address
@@ -166,6 +212,48 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(json)))
         .unwrap())
+}
+
+// =========================================================================
+// Raw TCP byte echo origin (no HTTP, no TLS)
+// =========================================================================
+
+/// Spawn a raw TCP server that sends `banner` immediately on accept, then
+/// echoes every received byte verbatim until the peer closes. Returns the
+/// bound address.
+#[allow(dead_code)]
+pub async fn spawn_raw_tcp_echo(banner: &[u8]) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let banner = banner.to_vec();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let banner = banner.clone();
+            tokio::spawn(async move {
+                let _ = stream.write_all(&banner).await;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    addr
 }
 
 // =========================================================================

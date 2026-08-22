@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use rustls::ServerConfig;
 
+use crate::InterceptDecider;
 use crate::config::ProxyConfig;
 use crate::inspect::Inspectors;
 use crate::upstream::Upstream;
@@ -18,6 +19,9 @@ pub struct ProxyState {
     pub upstream: Upstream,
     /// Request/response inspection hooks.
     pub inspectors: Inspectors,
+    /// Decides which `CONNECT` tunnels get TLS-terminated. Tunnels the decider
+    /// rejects are relayed byte-for-byte without touching TLS.
+    pub intercept_decider: Arc<dyn InterceptDecider>,
     /// Effective configuration.
     pub config: Arc<ProxyConfig>,
 }

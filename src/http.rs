@@ -5,11 +5,13 @@
 //!
 //! * **Plaintext** (`GET http://host/path`) — forwarded directly to the origin
 //!   over cleartext HTTP/1.x.
-//! * **`CONNECT host:port`** — we answer `200`, take over the tunnel, terminate
-//!   TLS with a freshly-minted per-host certificate, then serve the decrypted
-//!   inner connection (HTTP/1.x *or* HTTP/2, chosen by ALPN). Every decrypted
-//!   request/response passes through the inspect hooks before being re-encrypted
-//!   toward the origin.
+//! * **`CONNECT host:port`** — we answer `200`, then ask the
+//!   [`InterceptDecider`](crate::InterceptDecider) whether to terminate TLS:
+//!   approved tunnels are MITM'd with a freshly-minted per-host certificate
+//!   and the decrypted inner connection is served (HTTP/1.x *or* HTTP/2,
+//!   chosen by ALPN); rejected tunnels are relayed to the origin byte-for-byte
+//!   with no TLS setup at all, so no certificate is minted and nothing is
+//!   decrypted.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -148,6 +150,14 @@ where
     let host = authority.host().to_string();
     let port = authority.port_u16().unwrap_or(443);
 
+    // Narrow interception: only terminate TLS for hosts the decider approves.
+    // Anything else is relayed opaquely — no TLS setup runs on that branch, so
+    // no leaf certificate is minted and no decryption happens. `sni` is a
+    // placeholder (always `None` for now); see `InterceptDecider`.
+    if !state.intercept_decider.should_intercept(&authority, None) {
+        return opaque_tunnel(io, &authority, &host, port).await;
+    }
+
     let acceptor = TlsAcceptor::from(state.server_tls.clone());
     let tls = acceptor
         .accept(io)
@@ -183,6 +193,31 @@ where
         .serve_connection(hyper_io, service)
         .await
         .map_err(|e| eyre::eyre!("serving decrypted connection: {e}"))
+}
+
+/// Relay a CONNECT tunnel to the origin without touching TLS.
+///
+/// Both directions are copied verbatim: no certificate is minted and no bytes
+/// are decrypted. This branch is intentionally free of any TLS setup so the
+/// no-TLS invariant is auditable at a glance.
+async fn opaque_tunnel<I>(io: I, authority: &Authority, host: &str, port: u16) -> Result<()>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut upstream =
+        TcpStream::connect((host, port))
+            .await
+            .map_err(|source| ProxyError::Upstream {
+                authority: authority.to_string(),
+                source: eyre::eyre!(source),
+            })?;
+    upstream.set_nodelay(true).ok();
+
+    let mut client = io;
+    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+        .await
+        .map_err(|e| eyre::eyre!("opaque tunnel relay to {authority} failed: {e}"))?;
+    Ok(())
 }
 
 /// Choose the upstream host for a request. When the CONNECT target is an IP
@@ -316,4 +351,157 @@ fn simple(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from(msg.to_owned())))
         .expect("static response is always valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ca::CertAuthority;
+    use crate::cert_resolver::DynamicCertResolver;
+    use crate::inspect::Inspectors;
+    use crate::state::ProxyState;
+    use crate::upstream::Upstream;
+    use crate::{NoInterceptDecider, ProxyConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Read exactly `buf.len()` bytes from `stream`.
+    async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) {
+        let mut got = 0;
+        while got < buf.len() {
+            let n = stream.read(&mut buf[got..]).await.unwrap();
+            assert!(
+                n > 0,
+                "connection closed after {} of {} bytes",
+                got,
+                buf.len()
+            );
+            got += n;
+        }
+    }
+
+    /// Raw CONNECT through the proxy, asserting a `200` response head.
+    async fn raw_connect(proxy_addr: SocketAddr, host: &str, port: u16) -> TcpStream {
+        let mut tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        tcp.set_nodelay(true).ok();
+
+        let connect_req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+        tcp.write_all(connect_req.as_bytes()).await.unwrap();
+
+        let mut buf = [0u8; 4096];
+        let mut total = 0;
+        let mut found_end = false;
+        while total < buf.len() {
+            let n = tcp.read(&mut buf[total..total + 1]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if total >= 4 && &buf[total - 4..total] == b"\r\n\r\n" {
+                found_end = true;
+                break;
+            }
+        }
+        assert!(found_end, "CONNECT response must end with double CRLF");
+        let head = String::from_utf8_lossy(&buf[..total]);
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+        tcp
+    }
+
+    /// Invariant: a tunnel the decider rejects must never mint a leaf
+    /// certificate for the host.
+    ///
+    /// This lives in the crate (rather than `tests/`) because the certificate
+    /// cache lives inside `DynamicCertResolver`, which `MitmProxy::run`
+    /// constructs internally and does not expose. Here we build the same
+    /// [`ProxyState`] `run` would build, but keep the resolver so we can
+    /// assert on its cache after the relay completes.
+    #[tokio::test]
+    async fn tunneled_host_gets_no_certificate_minted() {
+        crate::install_crypto_provider();
+
+        // Raw byte origin: pushes a banner, echoes everything back, and
+        // signals when the connection closes so the test knows the tunneled
+        // relay has fully completed.
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let banner: Vec<u8> = (0..257u32).map(|i| (i % 251) as u8).collect();
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+        let banner_for_server = banner.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let _ = stream.write_all(&banner_for_server).await;
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = close_tx.send(());
+        });
+
+        // Same state construction `MitmProxy::run` uses, with a resolver the
+        // test holds on to.
+        let (cert_pem, key_pem) = CertAuthority::generate_root().unwrap();
+        let ca = Arc::new(CertAuthority::from_pem(cert_pem, &key_pem).unwrap());
+        let resolver = Arc::new(DynamicCertResolver::new(ca));
+        let server_tls = crate::tls::server_config(resolver.clone(), crate::tls::TCP_ALPN);
+        let client_tls = crate::tls::client_config(false, crate::tls::TCP_ALPN);
+
+        let ca_dir = tempfile::TempDir::new().unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+
+        let state = Arc::new(ProxyState {
+            server_tls,
+            h3_tls: crate::tls::server_config(resolver.clone(), crate::tls::H3_ALPN),
+            upstream: Upstream::new(client_tls),
+            inspectors: Inspectors::default(),
+            intercept_decider: Arc::new(NoInterceptDecider),
+            config: Arc::new(ProxyConfig::new(proxy_addr, ca_dir.path())),
+        });
+        let serve_handle = tokio::spawn(async move {
+            let _ = serve(state).await;
+        });
+
+        // Let the listener bind before connecting.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // The decider (NoInterceptDecider) rejects everything: the tunnel must
+        // be relayed raw, so verify bytes flow both ways untouched.
+        let mut tunnel = raw_connect(proxy_addr, "127.0.0.1", origin.port()).await;
+        let mut got_banner = vec![0u8; banner.len()];
+        read_exact(&mut tunnel, &mut got_banner).await;
+        assert_eq!(got_banner, banner);
+
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        tunnel.write_all(&payload).await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        read_exact(&mut tunnel, &mut echoed).await;
+        assert_eq!(echoed, payload);
+
+        // Close the client side and wait for the relay to wind down.
+        drop(tunnel);
+        let _ = close_rx.await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The core invariant: no leaf certificate was minted for the tunneled
+        // host — in fact the cache must be entirely empty.
+        assert!(
+            !resolver.has_cached_key("127.0.0.1"),
+            "tunneled host must not have a cached certificate"
+        );
+        assert_eq!(
+            resolver.cache_len(),
+            0,
+            "no certificate may be minted on the opaque tunnel path"
+        );
+
+        serve_handle.abort();
+    }
 }
