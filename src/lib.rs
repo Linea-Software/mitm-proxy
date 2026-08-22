@@ -40,6 +40,7 @@ pub mod ca;
 pub mod config;
 pub mod error;
 pub mod inspect;
+pub mod intercept;
 
 mod cert_resolver;
 mod http;
@@ -60,6 +61,7 @@ pub use inspect::{
     BufferedRequest, BufferedResponse, ConnMeta, Inspectors, Protocol, RequestAction,
     RequestInspector, ResponseAction, ResponseInspector,
 };
+pub use intercept::{InterceptDecider, NoInterceptDecider};
 
 use cert_resolver::DynamicCertResolver;
 use inspect::NoopInspector;
@@ -72,6 +74,7 @@ use upstream::Upstream;
 pub struct MitmProxy {
     config: ProxyConfig,
     inspectors: Inspectors,
+    intercept_decider: Arc<dyn InterceptDecider>,
 }
 
 impl MitmProxy {
@@ -81,6 +84,7 @@ impl MitmProxy {
         Self {
             config,
             inspectors: Inspectors::default(),
+            intercept_decider: Arc::new(NoInterceptDecider),
         }
     }
 
@@ -99,6 +103,17 @@ impl MitmProxy {
     /// Set both inspection hooks at once.
     pub fn with_inspectors(mut self, inspectors: Inspectors) -> Self {
         self.inspectors = inspectors;
+        self
+    }
+
+    /// Set the interception decision hook.
+    ///
+    /// Tunnels for which `should_intercept` returns `false` are relayed to the
+    /// origin byte-for-byte without any TLS termination; only hosts the
+    /// decider approves ever get a leaf certificate minted. Without this the
+    /// proxy intercepts nothing (see [`NoInterceptDecider`]).
+    pub fn with_intercept_decider(mut self, decider: Arc<dyn InterceptDecider>) -> Self {
+        self.intercept_decider = decider;
         self
     }
 
@@ -135,6 +150,7 @@ impl MitmProxy {
             upstream: Upstream::new(client_tls),
             inspectors: self.inspectors,
             config: Arc::new(self.config.clone()),
+            intercept_decider: self.intercept_decider,
         });
 
         // --- listeners --------------------------------------------------

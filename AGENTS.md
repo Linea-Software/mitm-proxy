@@ -52,7 +52,8 @@ tests/
 ├── inspector_tests.rs— Observe, mutate, block semantics
 ├── proxy_http1.rs  — HTTP/1.1 plaintext + CONNECT
 ├── proxy_http2.rs  — HTTP/2 MITM + multiplexed streams
-└── proxy_http3.rs  — HTTP/3 GET/POST + stream FIN regression (Rust h3 client)
+├── proxy_http3.rs  — HTTP/3 GET/POST + stream FIN regression (Rust h3 client)
+└── tunnel_tests.rs — Narrow-interception invariants: opaque tunnel passthrough
 docs/
 ├── llms.full.txt   — Full LLM reference
 TESTING.md          — Test suite documentation
@@ -64,7 +65,13 @@ Cargo.toml          — Crate manifest
 ## Public API
 
 `MitmProxy::new(ProxyConfig)` → builder with `with_request_inspector`,
-`with_response_inspector`, `with_inspectors`, `.run()`.
+`with_response_inspector`, `with_inspectors`, `with_intercept_decider`,
+`.run()`.
+
+Narrow interception: `with_intercept_decider(Arc<dyn InterceptDecider>)`
+selects which CONNECT tunnels get TLS-terminated. Tunnels the decider rejects
+are relayed byte-for-byte with no TLS setup (no leaf certificate minted, no
+decryption). Default is `NoInterceptDecider` — intercept nothing.
 
 ### ProxyConfig fields
 

@@ -193,6 +193,9 @@ async fn send_response(stream: &mut H3Stream, resp: Response<Bytes>) -> Result<(
     // HTTP/3 frames the body by stream length; drop HTTP/1-style framing hints.
     parts.headers.remove(http::header::CONTENT_LENGTH);
     parts.headers.remove(http::header::TRANSFER_ENCODING);
+    // Do not advertise QUIC/H3 to the client: the UDP path is not available
+    // through the proxy, and an `alt-svc` hint would make browsers retry there.
+    parts.headers.remove(http::header::ALT_SVC);
 
     let head = Response::from_parts(parts, ());
     stream
