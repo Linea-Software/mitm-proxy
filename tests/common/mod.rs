@@ -147,11 +147,15 @@ async fn echo_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
     let body_text = String::from_utf8_lossy(&body);
 
     let json = format!(
-        r#"{{"method":"{}","uri":"{}","header_x_test":"{}","body":"{}"}}"#,
+        r#"{{"method":"{}","uri":"{}","header_x_test":"{}","header_host":"{}","body":"{}"}}"#,
         method,
         uri,
         headers
             .get("x-test")
+            .map(|v| v.to_str().unwrap_or(""))
+            .unwrap_or(""),
+        headers
+            .get("host")
             .map(|v| v.to_str().unwrap_or(""))
             .unwrap_or(""),
         body_text
@@ -223,6 +227,50 @@ pub async fn spawn_https_origin() -> (SocketAddr, SelfSignedCert) {
         }
     });
     (addr, cert)
+}
+
+/// Like [`spawn_https_origin`], but also reports the TLS SNI of every accepted
+/// connection: one `Option<String>` per connection, in accept order (`None`
+/// when no SNI was sent). Lets tests assert which hostname the *proxy* used
+/// for the upstream handshake.
+#[allow(dead_code)]
+pub async fn spawn_https_origin_with_sni_capture() -> (
+    SocketAddr,
+    SelfSignedCert,
+    tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
+) {
+    let (sni_tx, sni_rx) = tokio::sync::mpsc::unbounded_channel();
+    let cert = self_signed_cert();
+    let tls_cfg = tls_server_config(&cert);
+    let acceptor = TlsAcceptor::from(tls_cfg);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let a = acceptor.clone();
+            let sni_tx = sni_tx.clone();
+            tokio::spawn(async move {
+                let tls = match a.accept(stream).await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                let sni = tls.get_ref().1.server_name().map(|name| name.to_string());
+                let _ = sni_tx.send(sni);
+                let io = TokioIo::new(tls);
+                let svc = service_fn(echo_handler);
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    (addr, cert, sni_rx)
 }
 
 // =========================================================================

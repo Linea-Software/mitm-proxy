@@ -68,6 +68,26 @@ pub fn ensure_host_header(req: &mut Request<Full<Bytes>>, host: &str, port: u16,
     }
 }
 
+/// True when `host` is a literal IPv4 or IPv6 address.
+pub fn is_ip_literal(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Strip a `:port` suffix from a `host[:port]` string (e.g. a `Host` header
+/// value), leaving bracketed IPv6 literals intact.
+pub fn strip_port(host_port: &str) -> &str {
+    if let Some(rest) = host_port.strip_prefix('[') {
+        return match rest.find(']') {
+            Some(end) => &host_port[..end + 2],
+            None => host_port,
+        };
+    }
+    match host_port.rfind(':') {
+        Some(idx) => &host_port[..idx],
+        None => host_port,
+    }
+}
+
 /// Remove hop-by-hop headers that must not be forwarded across a proxy.
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
     const HOP: &[&str] = &[
@@ -179,6 +199,38 @@ mod tests {
         assert!(headers.contains_key("content-type"));
         assert!(!headers.contains_key("connection"));
         assert!(!headers.contains_key("transfer-encoding"));
+    }
+
+    // ---- is_ip_literal ----
+
+    #[test]
+    fn ip_literal_detects_v4_and_v6() {
+        assert!(is_ip_literal("127.0.0.1"));
+        assert!(is_ip_literal("3.173.21.63"));
+        assert!(is_ip_literal("::1"));
+        assert!(is_ip_literal("2001:db8::1"));
+    }
+
+    #[test]
+    fn ip_literal_rejects_domains() {
+        assert!(!is_ip_literal("example.com"));
+        assert!(!is_ip_literal("localhost"));
+        assert!(!is_ip_literal("[::1]")); // bracketed form is not a bare IpAddr
+    }
+
+    // ---- strip_port ----
+
+    #[test]
+    fn strip_port_removes_port_suffix() {
+        assert_eq!(strip_port("example.com:8443"), "example.com");
+        assert_eq!(strip_port("example.com"), "example.com");
+        assert_eq!(strip_port("127.0.0.1:443"), "127.0.0.1");
+    }
+
+    #[test]
+    fn strip_port_keeps_bracketed_ipv6() {
+        assert_eq!(strip_port("[::1]:8080"), "[::1]");
+        assert_eq!(strip_port("[::1]"), "[::1]");
     }
 
     // ---- ensure_host_header ----

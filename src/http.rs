@@ -32,8 +32,10 @@ use crate::error::{ProxyError, Result};
 use crate::inspect::{BufferedResponse, ConnMeta, Protocol, RequestAction};
 use crate::state::SharedState;
 use crate::util::{
-    absolute_uri, authority_display, ensure_host_header, snapshot_request_head, strip_hop_by_hop,
+    absolute_uri, authority_display, ensure_host_header, is_ip_literal, snapshot_request_head,
+    strip_hop_by_hop, strip_port,
 };
+use rustls::pki_types::ServerName;
 
 /// Bind and serve the HTTP/1.x + HTTP/2 forward proxy until the process exits.
 pub async fn serve(state: SharedState) -> Result<()> {
@@ -183,6 +185,36 @@ where
         .map_err(|e| eyre::eyre!("serving decrypted connection: {e}"))
 }
 
+/// Choose the upstream host for a request. When the CONNECT target is an IP
+/// literal (ace-tun falls back to the snooped IP when its DNS snoop misses),
+/// the real hostname is recovered from the request itself — the URI authority
+/// (`:authority` for HTTP/2, also absolute-form HTTP/1.1) first, then the
+/// `Host` header with any `:port` suffix stripped — so the upstream SNI
+/// carries a domain instead of an IP (CDNs reject SNI literals with a
+/// handshake failure). Returns `None` when the CONNECT target is already a
+/// domain or the request offers no usable hostname; the caller then keeps the
+/// CONNECT-derived host, so IP-literal requests that worked before keep
+/// working.
+fn upstream_host_for<B>(req: &Request<B>, connect_host: &str) -> Option<String> {
+    if !is_ip_literal(connect_host) {
+        return None;
+    }
+    let candidate = req
+        .uri()
+        .authority()
+        .map(|authority| authority.host())
+        .or_else(|| {
+            req.headers()
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(strip_port)
+        })?;
+    if is_ip_literal(candidate) || ServerName::try_from(candidate.to_owned()).is_err() {
+        return None;
+    }
+    Some(candidate.to_owned())
+}
+
 /// The shared request pipeline: buffer, inspect, forward upstream, inspect the
 /// response, return it. `secure` selects the upstream scheme.
 async fn relay(
@@ -193,9 +225,14 @@ async fn relay(
     port: u16,
     state: SharedState,
 ) -> Response<Full<Bytes>> {
+    // An IP-literal CONNECT target must not be used as the upstream SNI — CDNs
+    // reject SNI literals with a handshake failure. Prefer the hostname the
+    // request itself carries (`:authority` for HTTP/2, `Host` for HTTP/1.x).
+    let upstream_host = upstream_host_for(&req, &host).unwrap_or(host);
+
     // Rebuild an absolute target URI (origin-form requests inside a tunnel lack
     // scheme/authority; plaintext ones already have them).
-    let abs_uri = match absolute_uri(req.uri(), &host, port, secure) {
+    let abs_uri = match absolute_uri(req.uri(), &upstream_host, port, secure) {
         Ok(u) => u,
         Err(e) => return simple(StatusCode::BAD_REQUEST, &format!("bad request URI: {e}")),
     };
@@ -232,13 +269,17 @@ async fn relay(
 
     let mut ureq = Request::from_parts(req_head, Full::new(req_body));
     strip_hop_by_hop(ureq.headers_mut());
-    ensure_host_header(&mut ureq, &host, port, secure);
+    ensure_host_header(&mut ureq, &upstream_host, port, secure);
 
     // --- forward upstream -----------------------------------------------
-    let upstream_resp = match state.upstream.send(secure, &host, port, ureq).await {
+    let upstream_resp = match state
+        .upstream
+        .send(secure, &upstream_host, port, ureq)
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
-            warn!("upstream {host}:{port} failed: {e:#}");
+            warn!("upstream {upstream_host}:{port} failed: {e:#}");
             return simple(StatusCode::BAD_GATEWAY, "upstream request failed");
         }
     };
