@@ -80,7 +80,7 @@ Options:
 
 | Decision | Rationale |
 |----------|-----------|
-| **Bodies buffered to `Bytes`** | Keeps the inspect hook simple and makes modification trivial, at the cost of not streaming very large payloads. Acceptable for an inspection-focused MITM. |
+| **Selective response buffering** | Requests and transformable HTML responses are buffered with a hard limit; other responses stream with backpressure. HTTP/1.1 WebSockets become opaque only after request inspection accepts the upgrade. |
 | **No connection pooling upstream** | Each request gets its own upstream connection. Keeps the code self-contained; pooling is a documented non-goal. |
 | **`.send_grease(false)` on h3** | `h3` 0.0.8 writes GREASE frames during `finish()` on the first request per connection, which confuses strict h3 clients (notably aioquic). Disabled to maximise interop. |
 | **Dynamic per-host leaf certs via rcgen** | The `DynamicCertResolver` mints and caches a leaf certificate per SNI host, signed by the proxy's root CA. The root CA is generated once and persisted to `./mitm-ca/`. |

@@ -3,7 +3,7 @@
 //! Given a fully-buffered request, [`Upstream::send`] opens a fresh connection
 //! to the origin (TCP, optionally wrapped in TLS with ALPN negotiation),
 //! performs the matching hyper client handshake (HTTP/1.x or HTTP/2), sends the
-//! request, and buffers the response back into memory.
+//! request, and returns the streaming response body to the relay.
 //!
 //! Connections are not pooled — each request gets its own. That keeps the code
 //! self-contained; pooling (via `hyper-util`'s legacy client) is a documented
@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use eyre::{Context, eyre};
 use http::header::{HOST, HeaderValue};
 use http::{Request, Response};
@@ -25,10 +25,17 @@ use tracing::debug;
 
 use crate::error::{ProxyError, Result};
 
-/// Opens connections to upstream origins and relays buffered requests.
+/// Opens connections to upstream origins and relays requests.
 #[derive(Clone)]
 pub struct Upstream {
     tls: Arc<ClientConfig>,
+}
+
+/// An accepted HTTP/1.1 upgrade plus the future that yields the upstream
+/// byte stream after hyper releases HTTP ownership.
+pub(crate) struct UpgradedResponse {
+    pub response: Response<Bytes>,
+    pub upgrade: hyper::upgrade::OnUpgrade,
 }
 
 impl Upstream {
@@ -36,15 +43,15 @@ impl Upstream {
         Self { tls }
     }
 
-    /// Send `req` to `host:port`, using TLS when `secure` is set. Returns the
-    /// response with its body buffered into [`Bytes`].
+    /// Send `req` to `host:port`, using TLS when `secure` is set. The response
+    /// body remains streaming so the caller can apply its inspection policy.
     pub async fn send(
         &self,
         secure: bool,
         host: &str,
         port: u16,
         req: Request<Full<Bytes>>,
-    ) -> Result<Response<Bytes>> {
+    ) -> Result<Response<hyper::body::Incoming>> {
         let authority = format!("{host}:{port}");
 
         let tcp = TcpStream::connect((host, port))
@@ -85,12 +92,58 @@ impl Upstream {
         }
     }
 
+    /// Send a traditional HTTP/1.1 WebSocket handshake upstream.
+    ///
+    /// WebSocket upgrades cannot be translated to an ordinary HTTP/2 request,
+    /// so TLS ALPN is intentionally constrained to HTTP/1.1 for this one
+    /// connection. The caller remains responsible for validating the `101`
+    /// response and joining the two upgraded streams.
+    pub(crate) async fn send_upgrade(
+        &self,
+        secure: bool,
+        host: &str,
+        port: u16,
+        req: Request<Full<Bytes>>,
+    ) -> Result<UpgradedResponse> {
+        let authority = format!("{host}:{port}");
+        let tcp = TcpStream::connect((host, port))
+            .await
+            .map_err(|e| ProxyError::Upstream {
+                authority: authority.clone(),
+                source: eyre!("tcp connect: {e}"),
+            })?;
+        tcp.set_nodelay(true).ok();
+
+        if secure {
+            let mut tls_config = (*self.tls).clone();
+            tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let connector = TlsConnector::from(Arc::new(tls_config));
+            let server_name = ServerName::try_from(host.to_string())
+                .map_err(|e| eyre!("invalid upstream server name {host:?}: {e}"))?;
+            let tls =
+                connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| ProxyError::Upstream {
+                        authority: authority.clone(),
+                        source: eyre!("tls handshake: {e}"),
+                    })?;
+
+            debug!("upstream {authority} negotiated http/1.1 for upgrade");
+            self.send_h1_upgrade(TokioIo::new(tls), &authority, req)
+                .await
+        } else {
+            self.send_h1_upgrade(TokioIo::new(tcp), &authority, req)
+                .await
+        }
+    }
+
     async fn send_h1<I>(
         &self,
         io: I,
         authority: &str,
         req: Request<Full<Bytes>>,
-    ) -> Result<Response<Bytes>>
+    ) -> Result<Response<hyper::body::Incoming>>
     where
         I: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
     {
@@ -121,11 +174,48 @@ impl Upstream {
             }
         });
 
-        let resp = sender
+        sender
             .send_request(req)
             .await
-            .wrap_err_with(|| format!("http/1 request to {authority} failed"))?;
-        buffer_response(resp).await
+            .wrap_err_with(|| format!("http/1 request to {authority} failed"))
+    }
+
+    async fn send_h1_upgrade<I>(
+        &self,
+        io: I,
+        authority: &str,
+        mut req: Request<Full<Bytes>>,
+    ) -> Result<UpgradedResponse>
+    where
+        I: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
+    {
+        if !req.headers().contains_key(HOST)
+            && let Some(authority) = req.uri().authority()
+            && let Ok(value) = HeaderValue::from_str(authority.as_str())
+        {
+            req.headers_mut().insert(HOST, value);
+        }
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| ProxyError::Upstream {
+                authority: authority.to_string(),
+                source: eyre!("http/1 handshake: {e}"),
+            })?;
+
+        tokio::spawn(async move {
+            if let Err(e) = conn.with_upgrades().await {
+                debug!("upstream upgraded http/1 connection closed: {e}");
+            }
+        });
+
+        let mut response = sender
+            .send_request(req)
+            .await
+            .wrap_err_with(|| format!("http/1 upgrade request to {authority} failed"))?;
+        let upgrade = hyper::upgrade::on(&mut response);
+        let response = buffer_response(response, 64 * 1024).await?;
+        Ok(UpgradedResponse { response, upgrade })
     }
 
     async fn send_h2<I>(
@@ -133,7 +223,7 @@ impl Upstream {
         io: I,
         authority: &str,
         req: Request<Full<Bytes>>,
-    ) -> Result<Response<Bytes>>
+    ) -> Result<Response<hyper::body::Incoming>>
     where
         I: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
     {
@@ -150,23 +240,32 @@ impl Upstream {
             }
         });
 
-        let resp = sender
+        sender
             .send_request(req)
             .await
-            .wrap_err_with(|| format!("http/2 request to {authority} failed"))?;
-        buffer_response(resp).await
+            .wrap_err_with(|| format!("http/2 request to {authority} failed"))
     }
 }
 
-/// Collect a streaming response body into memory.
-async fn buffer_response(resp: Response<hyper::body::Incoming>) -> Result<Response<Bytes>> {
-    let (parts, body) = resp.into_parts();
-    let bytes = body
-        .collect()
-        .await
-        .wrap_err("reading upstream response body")?
-        .to_bytes();
-    Ok(Response::from_parts(parts, bytes))
+/// Collect a streaming response body into memory up to an explicit limit.
+pub(crate) async fn buffer_response(
+    resp: Response<hyper::body::Incoming>,
+    max_bytes: usize,
+) -> Result<Response<Bytes>> {
+    let (parts, mut body) = resp.into_parts();
+    let mut bytes = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.wrap_err("reading upstream response body")?;
+        if let Ok(data) = frame.into_data() {
+            if bytes.len().saturating_add(data.len()) > max_bytes {
+                return Err(eyre!(
+                    "upstream response body exceeded {max_bytes} byte inspection limit"
+                ));
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(Response::from_parts(parts, bytes.freeze()))
 }
 
 #[cfg(test)]

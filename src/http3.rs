@@ -20,11 +20,11 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use http::{Request, Response, StatusCode};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use tracing::{debug, info, warn};
 
 use crate::error::Result;
-use crate::inspect::{ConnMeta, Protocol, RequestAction};
+use crate::inspect::{ConnMeta, Protocol, RequestAction, ResponseBodyPolicy};
 use crate::state::SharedState;
 use crate::util::{absolute_uri, ensure_host_header, snapshot_request_head, strip_hop_by_hop};
 
@@ -176,14 +176,82 @@ async fn handle_request(
     };
 
     // --- response inspect hook ------------------------------------------
-    let mut buffered_resp = upstream_resp;
-    state
+    let mut response_head = Response::new(());
+    *response_head.status_mut() = upstream_resp.status();
+    *response_head.version_mut() = upstream_resp.version();
+    *response_head.headers_mut() = upstream_resp.headers().clone();
+    match state
         .inspectors
         .response
-        .inspect_response(&meta, &head_snapshot, &mut buffered_resp)
-        .await;
+        .response_body_policy(&meta, &head_snapshot, &response_head)
+        .await
+    {
+        ResponseBodyPolicy::Stream => {
+            let (parts, body) = upstream_resp.into_parts();
+            let mut inspected = Response::from_parts(parts, Bytes::new());
+            state
+                .inspectors
+                .response
+                .inspect_response(&meta, &head_snapshot, &mut inspected)
+                .await;
+            let (parts, replacement) = inspected.into_parts();
+            if replacement.is_empty() {
+                send_streaming_response(&mut stream, Response::from_parts(parts, body)).await
+            } else {
+                send_response(&mut stream, Response::from_parts(parts, replacement)).await
+            }
+        }
+        ResponseBodyPolicy::Buffer { max_bytes } => {
+            let mut buffered_resp =
+                match crate::upstream::buffer_response(upstream_resp, max_bytes).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        warn!("buffering h3 response from {host}:{port} failed: {error:#}");
+                        return respond_error(
+                            &mut stream,
+                            StatusCode::BAD_GATEWAY,
+                            "upstream response too large or incomplete",
+                        )
+                        .await;
+                    }
+                };
+            state
+                .inspectors
+                .response
+                .inspect_response(&meta, &head_snapshot, &mut buffered_resp)
+                .await;
+            send_response(&mut stream, buffered_resp).await
+        }
+    }
+}
 
-    send_response(&mut stream, buffered_resp).await
+async fn send_streaming_response(
+    stream: &mut H3Stream,
+    resp: Response<hyper::body::Incoming>,
+) -> Result<()> {
+    let (mut parts, mut body) = resp.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
+    parts.headers.remove(http::header::CONTENT_LENGTH);
+    parts.headers.remove(http::header::TRANSFER_ENCODING);
+    parts.headers.remove(http::header::ALT_SVC);
+    stream
+        .send_response(Response::from_parts(parts, ()))
+        .await
+        .map_err(|e| eyre::eyre!("sending h3 response head: {e}"))?;
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| eyre::eyre!("reading upstream response body: {e}"))?;
+        if let Ok(data) = frame.into_data() {
+            stream
+                .send_data(data)
+                .await
+                .map_err(|e| eyre::eyre!("sending h3 response body: {e}"))?;
+        }
+    }
+    stream
+        .finish()
+        .await
+        .map_err(|e| eyre::eyre!("finishing h3 stream: {e}"))
 }
 
 /// Send a buffered response over an HTTP/3 request stream.

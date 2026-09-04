@@ -286,6 +286,7 @@ pub async fn spawn_http1_origin() -> SocketAddr {
 // HTTPS origin (h1+h2)
 // =========================================================================
 
+#[allow(dead_code)]
 pub async fn spawn_https_origin() -> (SocketAddr, SelfSignedCert) {
     let cert = self_signed_cert();
     let tls_cfg = tls_server_config(&cert);

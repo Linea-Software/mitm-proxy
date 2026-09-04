@@ -88,6 +88,17 @@ struct BodyMutator;
 
 #[async_trait]
 impl ResponseInspector for BodyMutator {
+    async fn response_body_policy(
+        &self,
+        _meta: &ConnMeta,
+        _req_head: &http::request::Parts,
+        _res_head: &http::Response<()>,
+    ) -> mitm_proxy::ResponseBodyPolicy {
+        mitm_proxy::ResponseBodyPolicy::Buffer {
+            max_bytes: 1024 * 1024,
+        }
+    }
+
     async fn inspect_response(
         &self,
         _meta: &ConnMeta,

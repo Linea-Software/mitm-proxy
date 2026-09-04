@@ -110,6 +110,20 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+/// Strip hop-by-hop headers while retaining the normalized pair required for
+/// a traditional HTTP/1.1 protocol upgrade.
+pub fn strip_hop_by_hop_except_upgrade(headers: &mut HeaderMap) {
+    let upgrade = headers.get(http::header::UPGRADE).cloned();
+    strip_hop_by_hop(headers);
+    if let Some(upgrade) = upgrade {
+        headers.insert(http::header::UPGRADE, upgrade);
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("upgrade"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

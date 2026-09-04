@@ -1,17 +1,16 @@
 //! The transparent inspect point.
 //!
 //! After the proxy decrypts a request (and, later, its response) it hands the
-//! fully-buffered message to the caller's inspectors. An inspector may:
+//! message to the caller's inspectors. An inspector may:
 //!
 //! * observe the request/response,
 //! * mutate it in place (headers or body), or
 //! * short-circuit a request with a synthetic response (block / redirect).
 //!
-//! Bodies are buffered into [`Bytes`] before inspection. This keeps the hook
-//! simple and makes modification trivial, at the cost of not streaming very
-//! large payloads — an acceptable trade-off for an inspection-focused MITM
-//! (see the crate's non-goals). Websockets and other upgraded/streaming
-//! protocols are therefore not inspectable and are not currently tunnelled.
+//! Requests remain buffered. Response inspectors select bounded buffering for
+//! transformable bodies or head-only inspection with streaming passthrough.
+//! Traditional HTTP/1.1 WebSockets are inspected before their successful
+//! upgrade becomes an opaque bidirectional stream.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -58,6 +57,18 @@ pub type BufferedRequest = Request<Bytes>;
 /// A response body buffered into memory alongside its head.
 pub type BufferedResponse = Response<Bytes>;
 
+/// Whether a response body must be collected before inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseBodyPolicy {
+    /// Inspect the response head and forward body frames with backpressure.
+    Stream,
+    /// Buffer at most `max_bytes` before invoking the response inspector.
+    Buffer { max_bytes: usize },
+}
+
+/// Compatibility default for inspectors that transform response bodies.
+pub const DEFAULT_MAX_BUFFERED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Outcome of inspecting a request.
 pub enum RequestAction {
     /// Forward the (possibly-mutated) request upstream.
@@ -83,6 +94,44 @@ pub trait RequestInspector: Send + Sync {
 /// returned to the client.
 #[async_trait]
 pub trait ResponseInspector: Send + Sync {
+    /// Select body handling from request and response metadata. By default,
+    /// only browser document responses with an HTML content type are buffered;
+    /// inspectors that transform other body types must override this method.
+    async fn response_body_policy(
+        &self,
+        _meta: &ConnMeta,
+        req_head: &http::request::Parts,
+        res_head: &Response<()>,
+    ) -> ResponseBodyPolicy {
+        let is_document = req_head.method == http::Method::GET
+            && match req_head
+                .headers
+                .get("sec-fetch-dest")
+                .and_then(|value| value.to_str().ok())
+            {
+                Some("document") => true,
+                Some(_) => false,
+                None => req_head
+                    .headers
+                    .get(http::header::ACCEPT)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("text/html")),
+            };
+        let is_html = res_head
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/html"));
+
+        if is_document && is_html {
+            ResponseBodyPolicy::Buffer {
+                max_bytes: DEFAULT_MAX_BUFFERED_RESPONSE_BYTES,
+            }
+        } else {
+            ResponseBodyPolicy::Stream
+        }
+    }
+
     /// Inspect `res` in place.
     async fn inspect_response(
         &self,
@@ -127,6 +176,15 @@ impl RequestInspector for NoopInspector {
 
 #[async_trait]
 impl ResponseInspector for NoopInspector {
+    async fn response_body_policy(
+        &self,
+        _: &ConnMeta,
+        _: &http::request::Parts,
+        _: &Response<()>,
+    ) -> ResponseBodyPolicy {
+        ResponseBodyPolicy::Stream
+    }
+
     async fn inspect_response(
         &self,
         _: &ConnMeta,
@@ -144,12 +202,13 @@ pub struct LoggingInspector;
 #[async_trait]
 impl RequestInspector for LoggingInspector {
     async fn inspect_request(&self, meta: &ConnMeta, req: &mut BufferedRequest) -> RequestAction {
+        let host = request_host(req, &meta.authority);
         info!(
             proto = %meta.protocol,
             client = %meta.client_addr,
-            "-> {} {} ({} body bytes)",
+            "-> {} host={} ({} buffered request body bytes)",
             req.method(),
-            req.uri(),
+            host,
             req.body().len()
         );
         RequestAction::Continue
@@ -164,17 +223,62 @@ impl ResponseInspector for LoggingInspector {
         req_head: &http::request::Parts,
         res: &mut BufferedResponse,
     ) -> ResponseAction {
+        let host = request_parts_host(req_head, &meta.authority);
         info!(
             proto = %meta.protocol,
             client = %meta.client_addr,
-            "<- {} for {} {} ({} body bytes)",
+            "<- {} for {} host={} ({} inspected response body bytes)",
             res.status(),
             req_head.method,
-            req_head.uri,
+            host,
             res.body().len()
         );
         ResponseAction::Continue
     }
+}
+
+fn request_host<B>(request: &Request<B>, fallback: &str) -> String {
+    request
+        .uri()
+        .host()
+        .map(str::to_owned)
+        .or_else(|| {
+            request
+                .headers()
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<http::uri::Authority>().ok())
+                .map(|authority| authority.host().to_owned())
+        })
+        .or_else(|| {
+            fallback
+                .parse::<http::uri::Authority>()
+                .ok()
+                .map(|authority| authority.host().to_owned())
+        })
+        .unwrap_or_else(|| "<unknown>".to_owned())
+}
+
+fn request_parts_host(request: &http::request::Parts, fallback: &str) -> String {
+    request
+        .uri
+        .host()
+        .map(str::to_owned)
+        .or_else(|| {
+            request
+                .headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<http::uri::Authority>().ok())
+                .map(|authority| authority.host().to_owned())
+        })
+        .or_else(|| {
+            fallback
+                .parse::<http::uri::Authority>()
+                .ok()
+                .map(|authority| authority.host().to_owned())
+        })
+        .unwrap_or_else(|| "<unknown>".to_owned())
 }
 
 #[cfg(test)]
@@ -182,6 +286,19 @@ mod tests {
     use super::*;
     use http::StatusCode;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn log_host_excludes_path_query_and_userinfo() {
+        let request = Request::builder()
+            .uri("https://user:secret@example.com/private/token?api_key=secret")
+            .body(Bytes::new())
+            .unwrap();
+
+        assert_eq!(
+            request_host(&request, "fallback.invalid:443"),
+            "example.com"
+        );
+    }
 
     fn test_meta() -> ConnMeta {
         ConnMeta {

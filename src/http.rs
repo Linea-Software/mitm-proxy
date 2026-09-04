@@ -18,10 +18,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+use http::header::{CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING, UPGRADE};
 use http::uri::Authority;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -31,13 +31,16 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::error::{ProxyError, Result};
-use crate::inspect::{BufferedResponse, ConnMeta, Protocol, RequestAction};
+use crate::inspect::{ConnMeta, Protocol, RequestAction, ResponseBodyPolicy};
 use crate::state::SharedState;
 use crate::util::{
-    absolute_uri, authority_display, ensure_host_header, is_ip_literal, snapshot_request_head,
-    strip_hop_by_hop, strip_port,
+    absolute_uri, authority_display, ensure_host_header, snapshot_request_head, strip_hop_by_hop,
+    strip_hop_by_hop_except_upgrade, strip_port,
 };
 use rustls::pki_types::ServerName;
+
+type BodyError = Box<dyn std::error::Error + Send + Sync>;
+type ProxyBody = UnsyncBoxBody<Bytes, BodyError>;
 
 /// Bind and serve the HTTP/1.x + HTTP/2 forward proxy until the process exits.
 pub async fn serve(state: SharedState) -> Result<()> {
@@ -86,7 +89,7 @@ async fn outer_handler(
     req: Request<Incoming>,
     peer: SocketAddr,
     state: SharedState,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     if req.method() == Method::CONNECT {
         // e.g. `CONNECT example.com:443`.
         let Some(authority) = req.uri().authority().cloned() else {
@@ -106,7 +109,7 @@ async fn outer_handler(
         });
 
         // `200` tells the browser the tunnel is established; body is empty.
-        Response::new(Full::new(Bytes::new()))
+        Response::new(boxed_full(Bytes::new()))
     } else {
         forward_plaintext(req, peer, state).await
     }
@@ -117,7 +120,7 @@ async fn forward_plaintext(
     req: Request<Incoming>,
     peer: SocketAddr,
     state: SharedState,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let uri = req.uri().clone();
     let Some(host) = uri.host().map(str::to_owned) else {
         return simple(
@@ -190,7 +193,7 @@ where
 
     // `auto` serves either HTTP/1.x or HTTP/2 based on the negotiated protocol.
     auto::Builder::new(TokioExecutor::new())
-        .serve_connection(hyper_io, service)
+        .serve_connection_with_upgrades(hyper_io, service)
         .await
         .map_err(|e| eyre::eyre!("serving decrypted connection: {e}"))
 }
@@ -220,20 +223,21 @@ where
     Ok(())
 }
 
-/// Choose the upstream host for a request. When the CONNECT target is an IP
-/// literal (ace-tun falls back to the snooped IP when its DNS snoop misses),
-/// the real hostname is recovered from the request itself — the URI authority
-/// (`:authority` for HTTP/2, also absolute-form HTTP/1.1) first, then the
-/// `Host` header with any `:port` suffix stripped — so the upstream SNI
-/// carries a domain instead of an IP (CDNs reject SNI literals with a
-/// handshake failure). Returns `None` when the CONNECT target is already a
-/// domain or the request offers no usable hostname; the caller then keeps the
-/// CONNECT-derived host, so IP-literal requests that worked before keep
-/// working.
+/// Choose the upstream host for a request.
+///
+/// The CONNECT authority is only a transport hint from the caller. In Ace's
+/// TUN path it may be an IP literal when DNS snooping misses (for example with
+/// DoH), or a stale/wrong hostname because the snoop cache is necessarily a
+/// lossy `IP -> hostname` mapping for shared CDN addresses. Once TLS has been
+/// terminated, the request's own authority is the stronger source of truth:
+/// use the URI authority (`:authority` for HTTP/2, also absolute-form H1)
+/// first, then the `Host` header with any `:port` suffix stripped.
+///
+/// Returns `None` only when the request offers no valid TLS server name, in
+/// which case the caller keeps the CONNECT-derived host. The request is sampled
+/// before inspectors run, so an inspector cannot use this helper to reroute an
+/// upstream connection.
 fn upstream_host_for<B>(req: &Request<B>, connect_host: &str) -> Option<String> {
-    if !is_ip_literal(connect_host) {
-        return None;
-    }
     let candidate = req
         .uri()
         .authority()
@@ -244,7 +248,10 @@ fn upstream_host_for<B>(req: &Request<B>, connect_host: &str) -> Option<String> 
                 .and_then(|value| value.to_str().ok())
                 .map(strip_port)
         })?;
-    if is_ip_literal(candidate) || ServerName::try_from(candidate.to_owned()).is_err() {
+    if ServerName::try_from(candidate.to_owned()).is_err() {
+        return None;
+    }
+    if candidate.eq_ignore_ascii_case(connect_host) {
         return None;
     }
     Some(candidate.to_owned())
@@ -253,16 +260,21 @@ fn upstream_host_for<B>(req: &Request<B>, connect_host: &str) -> Option<String> 
 /// The shared request pipeline: buffer, inspect, forward upstream, inspect the
 /// response, return it. `secure` selects the upstream scheme.
 async fn relay(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     meta: ConnMeta,
     secure: bool,
     host: String,
     port: u16,
     state: SharedState,
-) -> Response<Full<Bytes>> {
-    // An IP-literal CONNECT target must not be used as the upstream SNI — CDNs
-    // reject SNI literals with a handshake failure. Prefer the hostname the
-    // request itself carries (`:authority` for HTTP/2, `Host` for HTTP/1.x).
+) -> Response<ProxyBody> {
+    // Hyper only exposes the decrypted byte stream after a successful HTTP/1.1
+    // upgrade. HTTP/2 extended CONNECT is deliberately not advertised by the
+    // server builder, so browsers use a traditional upgrade connection.
+    let downstream_upgrade = is_websocket_upgrade(&req).then(|| hyper::upgrade::on(&mut req));
+
+    // The CONNECT target may be an IP literal (DNS-snoop miss) or a stale
+    // hostname from a shared-IP cache entry. Prefer the hostname carried by the
+    // decrypted request (`:authority` for HTTP/2, `Host` for HTTP/1.x).
     let upstream_host = upstream_host_for(&req, &host).unwrap_or(host);
 
     // Rebuild an absolute target URI (origin-form requests inside a tunnel lack
@@ -303,8 +315,44 @@ async fn relay(
     let head_snapshot = snapshot_request_head(&req_head);
 
     let mut ureq = Request::from_parts(req_head, Full::new(req_body));
-    strip_hop_by_hop(ureq.headers_mut());
+    let relay_websocket = downstream_upgrade.is_some() && is_websocket_upgrade(&ureq);
+    if relay_websocket {
+        strip_hop_by_hop_except_upgrade(ureq.headers_mut());
+    } else {
+        strip_hop_by_hop(ureq.headers_mut());
+    }
     ensure_host_header(&mut ureq, &upstream_host, port, secure);
+
+    if relay_websocket {
+        let upstream = match state
+            .upstream
+            .send_upgrade(secure, &upstream_host, port, ureq)
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                warn!("upstream {upstream_host}:{port} upgrade failed: {e:#}");
+                return simple(StatusCode::BAD_GATEWAY, "upstream request failed");
+            }
+        };
+
+        let mut response = upstream.response;
+        state
+            .inspectors
+            .response
+            .inspect_response(&meta, &head_snapshot, &mut response)
+            .await;
+
+        if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            spawn_websocket_relay(
+                downstream_upgrade.expect("WebSocket upgrade was captured"),
+                upstream.upgrade,
+                meta.authority.clone(),
+            );
+            return into_upgrade(response);
+        }
+        return into_full(response);
+    }
 
     // --- forward upstream -----------------------------------------------
     let upstream_resp = match state
@@ -320,14 +368,97 @@ async fn relay(
     };
 
     // --- response inspect hook ------------------------------------------
-    let mut buffered_resp: BufferedResponse = upstream_resp;
-    state
+    let response_head = response_head(&upstream_resp);
+    match state
         .inspectors
         .response
-        .inspect_response(&meta, &head_snapshot, &mut buffered_resp)
+        .response_body_policy(&meta, &head_snapshot, &response_head)
+        .await
+    {
+        ResponseBodyPolicy::Stream => {
+            let (parts, body) = upstream_resp.into_parts();
+            let mut inspected = Response::from_parts(parts, Bytes::new());
+            state
+                .inspectors
+                .response
+                .inspect_response(&meta, &head_snapshot, &mut inspected)
+                .await;
+            let (parts, replacement) = inspected.into_parts();
+            if replacement.is_empty() {
+                into_stream(parts, body)
+            } else {
+                into_full(Response::from_parts(parts, replacement))
+            }
+        }
+        ResponseBodyPolicy::Buffer { max_bytes } => {
+            let mut buffered_resp =
+                match crate::upstream::buffer_response(upstream_resp, max_bytes).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        warn!("buffering response from {upstream_host}:{port} failed: {error:#}");
+                        return simple(
+                            StatusCode::BAD_GATEWAY,
+                            "upstream response too large or incomplete",
+                        );
+                    }
+                };
+            state
+                .inspectors
+                .response
+                .inspect_response(&meta, &head_snapshot, &mut buffered_resp)
+                .await;
+            into_full(buffered_resp)
+        }
+    }
+}
+
+fn response_head<B>(response: &Response<B>) -> Response<()> {
+    let mut head = Response::new(());
+    *head.status_mut() = response.status();
+    *head.version_mut() = response.version();
+    *head.headers_mut() = response.headers().clone();
+    head
+}
+
+fn is_websocket_upgrade<B>(request: &Request<B>) -> bool {
+    request.version() == http::Version::HTTP_11
+        && request.method() == Method::GET
+        && request
+            .headers()
+            .get(UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        && request
+            .headers()
+            .get_all(CONNECTION)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+fn spawn_websocket_relay(
+    downstream: hyper::upgrade::OnUpgrade,
+    upstream: hyper::upgrade::OnUpgrade,
+    authority: String,
+) {
+    tokio::spawn(async move {
+        let result: Result<()> = async {
+            let (downstream, upstream) = tokio::try_join!(downstream, upstream)
+                .map_err(|error| eyre::eyre!("waiting for WebSocket upgrade: {error}"))?;
+            let mut downstream = TokioIo::new(downstream);
+            let mut upstream = TokioIo::new(upstream);
+            tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
+                .await
+                .map_err(|error| eyre::eyre!("copying WebSocket stream: {error}"))?;
+            Ok(())
+        }
         .await;
 
-    into_full(buffered_resp)
+        if let Err(error) = result {
+            debug!("WebSocket relay for {authority} ended: {error:#}");
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -335,21 +466,45 @@ async fn relay(
 // ---------------------------------------------------------------------------
 
 /// Convert a buffered response into one hyper can serve, fixing framing headers.
-fn into_full(resp: Response<Bytes>) -> Response<Full<Bytes>> {
+fn into_full(resp: Response<Bytes>) -> Response<ProxyBody> {
     let (mut parts, body) = resp.into_parts();
     strip_hop_by_hop(&mut parts.headers);
     // Body is fully buffered: let hyper set an accurate Content-Length.
     parts.headers.remove(TRANSFER_ENCODING);
     parts.headers.remove(CONTENT_LENGTH);
-    Response::from_parts(parts, Full::new(body))
+    Response::from_parts(parts, boxed_full(body))
+}
+
+fn into_upgrade(resp: Response<Bytes>) -> Response<ProxyBody> {
+    let (mut parts, body) = resp.into_parts();
+    parts.headers.remove(TRANSFER_ENCODING);
+    parts.headers.remove(CONTENT_LENGTH);
+    Response::from_parts(parts, boxed_full(body))
+}
+
+fn into_stream(
+    mut parts: http::response::Parts,
+    body: hyper::body::Incoming,
+) -> Response<ProxyBody> {
+    strip_hop_by_hop(&mut parts.headers);
+    let body = body
+        .map_err(|error| -> BodyError { Box::new(error) })
+        .boxed_unsync();
+    Response::from_parts(parts, body)
+}
+
+fn boxed_full(body: Bytes) -> ProxyBody {
+    Full::new(body)
+        .map_err(|never| -> BodyError { match never {} })
+        .boxed_unsync()
 }
 
 /// A tiny plaintext response (used for proxy-level errors).
-fn simple(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+fn simple(status: StatusCode, msg: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(msg.to_owned())))
+        .body(boxed_full(Bytes::from(msg.to_owned())))
         .expect("static response is always valid")
 }
 
@@ -363,6 +518,52 @@ mod tests {
     use crate::upstream::Upstream;
     use crate::{NoInterceptDecider, ProxyConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn upstream_host_prefers_request_authority_over_ip_connect_target() {
+        let request = Request::builder()
+            .uri("https://actual.example/path")
+            .body(())
+            .unwrap();
+
+        assert_eq!(
+            upstream_host_for(&request, "203.0.113.10").as_deref(),
+            Some("actual.example")
+        );
+    }
+
+    #[test]
+    fn upstream_host_prefers_request_authority_over_stale_domain_connect_target() {
+        let request = Request::builder()
+            .uri("https://actual.example/path")
+            .body(())
+            .unwrap();
+
+        assert_eq!(
+            upstream_host_for(&request, "stale-cache.example").as_deref(),
+            Some("actual.example")
+        );
+    }
+
+    #[test]
+    fn upstream_host_uses_host_header_for_origin_form_request() {
+        let request = Request::builder()
+            .uri("/path")
+            .header(http::header::HOST, "actual.example:443")
+            .body(())
+            .unwrap();
+
+        assert_eq!(
+            upstream_host_for(&request, "stale-cache.example").as_deref(),
+            Some("actual.example")
+        );
+    }
+
+    #[test]
+    fn upstream_host_keeps_connect_target_when_request_has_no_authority() {
+        let request = Request::builder().uri("/path").body(()).unwrap();
+        assert!(upstream_host_for(&request, "fallback.example").is_none());
+    }
 
     /// Read exactly `buf.len()` bytes from `stream`.
     async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) {

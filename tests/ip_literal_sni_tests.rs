@@ -186,8 +186,57 @@ async fn ip_literal_connect_uses_request_authority_upstream() {
     assert_eq!(sni.as_deref(), Some("localhost"));
 }
 
-/// Control: when the CONNECT target is already a domain, the proxy keeps
-/// using it — the recovery must be a no-op on the normal path.
+/// Shared-CDN regression: ace-tun's passive cache is `IP -> hostname`, so a
+/// later lookup for another hostname on the same edge IP can overwrite the
+/// entry. A stale domain CONNECT target must not win over the authority carried
+/// by the decrypted browser request.
+#[tokio::test]
+async fn stale_domain_connect_uses_request_host_upstream() {
+    init_tracing();
+
+    let (origin_addr, _cert, mut sni_rx) = spawn_https_origin_with_sni_capture().await;
+    let ca_dir = TempDir::new().unwrap();
+    let tcp_addr = pick_tcp_addr().await;
+
+    let inspectors = Inspectors::default();
+    let (ca_pem, _handle) = start_proxy_on(tcp_addr, None, ca_dir.path(), inspectors).await;
+
+    let tls = connect_and_tls(
+        tcp_addr,
+        &ca_pem,
+        "stale-cache.example",
+        origin_addr.port(),
+        "localhost",
+        &[b"http/1.1"],
+    )
+    .await;
+
+    let tls_io = TokioIo::new(tls);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/echo?stale-domain=1")
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(tls_io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("/echo?stale-domain=1"));
+
+    let sni = sni_rx
+        .recv()
+        .await
+        .expect("origin must accept exactly one TLS connection");
+    assert_eq!(sni.as_deref(), Some("localhost"));
+}
+
+/// Control: when the CONNECT target already matches the decrypted request host,
+/// the recovery is a no-op and existing domain routing stays unchanged.
 #[tokio::test]
 async fn domain_connect_keeps_existing_behavior() {
     init_tracing();
