@@ -104,14 +104,16 @@ impl Upstream {
                 Err(ProxyError::Upstream {
                     authority,
                     source: eyre!("origin negotiated HTTP/2 for an HTTP/1.1 upgrade"),
-                })
+                }
+                .into())
             } else if is_h2 {
                 self.send_h2(TokioIo::new(tls), &authority, req).await
             } else if requires_h2 {
                 Err(ProxyError::Upstream {
                     authority,
                     source: eyre!("origin did not negotiate HTTP/2 for extended CONNECT"),
-                })
+                }
+                .into())
             } else {
                 self.send_h1(TokioIo::new(tls), &authority, req).await
             }
@@ -119,7 +121,8 @@ impl Upstream {
             Err(ProxyError::Upstream {
                 authority,
                 source: eyre!("extended CONNECT requires an HTTP/2 upstream"),
-            })
+            }
+            .into())
         } else {
             self.send_h1(TokioIo::new(tcp), &authority, req).await
         }
