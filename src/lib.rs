@@ -59,7 +59,7 @@ pub use config::ProxyConfig;
 pub use error::{ProxyError, Result};
 pub use inspect::{
     BufferedRequest, BufferedResponse, ConnMeta, Inspectors, Protocol, RequestAction,
-    RequestInspector, ResponseAction, ResponseInspector,
+    RequestInspector, ResponseAction, ResponseBodyMode, ResponseInspector,
 };
 pub use intercept::{InterceptDecider, NoInterceptDecider};
 

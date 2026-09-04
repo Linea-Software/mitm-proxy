@@ -385,6 +385,56 @@ pub async fn proxy_plaintext_get(proxy_addr: SocketAddr, target_url: &str) -> (S
     (status, String::from_utf8_lossy(&body).to_string())
 }
 
+/// Establish a CONNECT tunnel and then TLS to the intercepted origin, trusting
+/// the proxy CA. The caller chooses the HTTP protocol to speak over the
+/// returned TLS stream.
+#[allow(dead_code)]
+pub async fn connect_tls_through_proxy(
+    proxy_addr: SocketAddr,
+    ca_pem: &str,
+    host: &str,
+    port: u16,
+    alpn: Vec<Vec<u8>>,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|r| r.ok()) {
+        roots.add(cert).unwrap();
+    }
+    let mut tls_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_cfg.alpn_protocols = alpn;
+    let tls_cfg = Arc::new(tls_cfg);
+
+    let mut tcp = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    tcp.set_nodelay(true).ok();
+    let connect_req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tcp.write_all(connect_req.as_bytes()).await.unwrap();
+
+    let mut head = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let n = tcp.read(&mut byte).await.unwrap();
+        assert!(n > 0, "CONNECT response closed before headers completed");
+        head.push(byte[0]);
+        assert!(head.len() < 16 * 1024, "CONNECT response headers too large");
+    }
+    let response_head = String::from_utf8_lossy(&head);
+    assert!(
+        response_head.starts_with("HTTP/1.1 200"),
+        "CONNECT must return 200, got: {response_head}"
+    );
+
+    tokio_rustls::TlsConnector::from(tls_cfg)
+        .connect(
+            rustls::pki_types::ServerName::try_from(host.to_string()).unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap()
+}
+
 /// CONNECT + TLS request through the proxy, trusting the proxy CA.
 #[allow(dead_code)]
 pub async fn proxy_connect_get(

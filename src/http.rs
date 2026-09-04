@@ -14,6 +14,7 @@
 //!   decrypted.
 
 use std::convert::Infallible;
+use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -21,7 +22,7 @@ use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::uri::Authority;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -31,13 +32,16 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::error::{ProxyError, Result};
-use crate::inspect::{BufferedResponse, ConnMeta, Protocol, RequestAction};
+use crate::inspect::{ConnMeta, Protocol, RequestAction, ResponseBodyMode};
 use crate::state::SharedState;
 use crate::util::{
     absolute_uri, authority_display, ensure_host_header, is_ip_literal, snapshot_request_head,
-    strip_hop_by_hop, strip_port,
+    strip_hop_by_hop, strip_hop_by_hop_for_upgrade, strip_port,
 };
 use rustls::pki_types::ServerName;
+
+type BoxError = Box<dyn Error + Send + Sync>;
+type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 
 /// Bind and serve the HTTP/1.x + HTTP/2 forward proxy until the process exits.
 pub async fn serve(state: SharedState) -> Result<()> {
@@ -86,7 +90,7 @@ async fn outer_handler(
     req: Request<Incoming>,
     peer: SocketAddr,
     state: SharedState,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     if req.method() == Method::CONNECT {
         // e.g. `CONNECT example.com:443`.
         let Some(authority) = req.uri().authority().cloned() else {
@@ -106,7 +110,7 @@ async fn outer_handler(
         });
 
         // `200` tells the browser the tunnel is established; body is empty.
-        Response::new(Full::new(Bytes::new()))
+        Response::new(full_body(Bytes::new()))
     } else {
         forward_plaintext(req, peer, state).await
     }
@@ -117,7 +121,7 @@ async fn forward_plaintext(
     req: Request<Incoming>,
     peer: SocketAddr,
     state: SharedState,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let uri = req.uri().clone();
     let Some(host) = uri.host().map(str::to_owned) else {
         return simple(
@@ -189,8 +193,10 @@ where
     });
 
     // `auto` serves either HTTP/1.x or HTTP/2 based on the negotiated protocol.
-    auto::Builder::new(TokioExecutor::new())
-        .serve_connection(hyper_io, service)
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http2().enable_connect_protocol();
+    builder
+        .serve_connection_with_upgrades(hyper_io, service)
         .await
         .map_err(|e| eyre::eyre!("serving decrypted connection: {e}"))
 }
@@ -259,7 +265,7 @@ async fn relay(
     host: String,
     port: u16,
     state: SharedState,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     // An IP-literal CONNECT target must not be used as the upstream SNI — CDNs
     // reject SNI literals with a handshake failure. Prefer the hostname the
     // request itself carries (`:authority` for HTTP/2, `Host` for HTTP/1.x).
@@ -272,7 +278,24 @@ async fn relay(
         Err(e) => return simple(StatusCode::BAD_REQUEST, &format!("bad request URI: {e}")),
     };
 
-    // Buffer the request body so inspectors get the whole message.
+    // HTTP/2 Extended CONNECT carries the tunneled protocol in the request and
+    // response body streams. Aggregating either side would deadlock a long-lived
+    // WebSocket, so inspect only the request head and relay both bodies.
+    if req.method() == Method::CONNECT
+        && req.version() == http::Version::HTTP_2
+        && req.extensions().get::<hyper::ext::Protocol>().is_some()
+    {
+        return relay_extended_connect(req, meta, secure, upstream_host, port, state, abs_uri).await;
+    }
+
+    let mut req = req;
+    let client_upgrade = if is_http1_upgrade_request(&req) {
+        Some(hyper::upgrade::on(&mut req))
+    } else {
+        None
+    };
+
+    // Buffer ordinary request bodies so inspectors retain their mutation API.
     let (mut parts, body) = req.into_parts();
     parts.uri = abs_uri;
     let body_bytes = match body.collect().await {
@@ -303,7 +326,11 @@ async fn relay(
     let head_snapshot = snapshot_request_head(&req_head);
 
     let mut ureq = Request::from_parts(req_head, Full::new(req_body));
-    strip_hop_by_hop(ureq.headers_mut());
+    if client_upgrade.is_some() {
+        strip_hop_by_hop_for_upgrade(ureq.headers_mut());
+    } else {
+        strip_hop_by_hop(ureq.headers_mut());
+    }
     ensure_host_header(&mut ureq, &upstream_host, port, secure);
 
     // --- forward upstream -----------------------------------------------
@@ -319,37 +346,181 @@ async fn relay(
         }
     };
 
-    // --- response inspect hook ------------------------------------------
-    let mut buffered_resp: BufferedResponse = upstream_resp;
-    state
-        .inspectors
-        .response
-        .inspect_response(&meta, &head_snapshot, &mut buffered_resp)
-        .await;
-
-    into_full(buffered_resp)
+    finish_upstream_response(upstream_resp, meta, head_snapshot, state, client_upgrade).await
 }
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
+fn is_http1_upgrade_request<B>(req: &Request<B>) -> bool {
+    if req.version() != http::Version::HTTP_11
+        || !req.headers().contains_key(http::header::UPGRADE)
+    {
+        return false;
+    }
+
+    req.headers()
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+async fn relay_extended_connect(
+    req: Request<Incoming>,
+    meta: ConnMeta,
+    secure: bool,
+    upstream_host: String,
+    port: u16,
+    state: SharedState,
+    abs_uri: http::Uri,
+) -> Response<ProxyBody> {
+    let (mut parts, body) = req.into_parts();
+    let extended_protocol = parts.extensions.get::<hyper::ext::Protocol>().cloned();
+    parts.uri = abs_uri;
+
+    // The CONNECT body is the tunneled byte stream. Give inspectors the request
+    // metadata with an empty body so blocking decisions still run without
+    // consuming the protocol stream.
+    let mut buffered_head = Request::from_parts(snapshot_request_head(&parts), Bytes::new());
+    match state
+        .inspectors
+        .request
+        .inspect_request(&meta, &mut buffered_head)
+        .await
+    {
+        RequestAction::Continue => {}
+        RequestAction::Respond(resp) => return into_full(resp),
+    }
+
+    let (mut req_head, _) = buffered_head.into_parts();
+    if let Some(protocol) = extended_protocol {
+        req_head.extensions.insert(protocol);
+    }
+    let head_snapshot = snapshot_request_head(&req_head);
+
+    let mut ureq = Request::from_parts(req_head, body);
+    strip_hop_by_hop(ureq.headers_mut());
+    ensure_host_header(&mut ureq, &upstream_host, port, secure);
+
+    let upstream_resp = match state
+        .upstream
+        .send(secure, &upstream_host, port, ureq)
+        .await
+    {
+        Ok(resp) => resp,
+        Err(error) => {
+            warn!("extended CONNECT upstream {upstream_host}:{port} failed: {error:#}");
+            return simple(StatusCode::BAD_GATEWAY, "upstream extended CONNECT failed");
+        }
+    };
+
+    finish_upstream_response(upstream_resp, meta, head_snapshot, state, None).await
+}
+
+async fn finish_upstream_response(
+    mut upstream_resp: Response<Incoming>,
+    meta: ConnMeta,
+    head_snapshot: http::request::Parts,
+    state: SharedState,
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+) -> Response<ProxyBody> {
+    if client_upgrade.is_some() && upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let upstream_upgrade = hyper::upgrade::on(&mut upstream_resp);
+        let (parts, _) = upstream_resp.into_parts();
+        let mut response_head = Response::from_parts(parts, Bytes::new());
+        state
+            .inspectors
+            .response
+            .inspect_response_head(&meta, &head_snapshot, &mut response_head)
+            .await;
+        let (mut parts, _) = response_head.into_parts();
+        strip_hop_by_hop_for_upgrade(&mut parts.headers);
+
+        let client_upgrade = client_upgrade.expect("upgrade request checked above");
+        tokio::spawn(async move {
+            match tokio::try_join!(client_upgrade, upstream_upgrade) {
+                Ok((client, upstream)) => {
+                    let mut client = TokioIo::new(client);
+                    let mut upstream = TokioIo::new(upstream);
+                    if let Err(error) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await
+                    {
+                        debug!("upgraded protocol relay ended: {error}");
+                    }
+                }
+                Err(error) => debug!("protocol upgrade failed: {error}"),
+            }
+        });
+
+        return Response::from_parts(parts, full_body(Bytes::new()));
+    }
+
+    let (parts, body) = upstream_resp.into_parts();
+    let mut response_head = Response::from_parts(parts, Bytes::new());
+    state
+        .inspectors
+        .response
+        .inspect_response_head(&meta, &head_snapshot, &mut response_head)
+        .await;
+    let body_mode = state
+        .inspectors
+        .response
+        .response_body_mode(&meta, &head_snapshot, &response_head);
+    let (mut parts, _) = response_head.into_parts();
+
+    match body_mode {
+        ResponseBodyMode::Stream => {
+            strip_hop_by_hop(&mut parts.headers);
+            Response::from_parts(parts, streaming_body(body))
+        }
+        ResponseBodyMode::Buffer => {
+            let body = match body.collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) => {
+                    warn!("reading upstream response body failed: {error}");
+                    return simple(StatusCode::BAD_GATEWAY, "reading upstream response failed");
+                }
+            };
+            let mut buffered = Response::from_parts(parts, body);
+            state
+                .inspectors
+                .response
+                .inspect_response(&meta, &head_snapshot, &mut buffered)
+                .await;
+            into_full(buffered)
+        }
+    }
+}
+
+fn full_body(bytes: Bytes) -> ProxyBody {
+    Full::new(bytes)
+        .map_err(|never: Infallible| -> BoxError { match never {} })
+        .boxed_unsync()
+}
+
+fn streaming_body(body: Incoming) -> ProxyBody {
+    body.map_err(|error| Box::new(error) as BoxError)
+        .boxed_unsync()
+}
+
 /// Convert a buffered response into one hyper can serve, fixing framing headers.
-fn into_full(resp: Response<Bytes>) -> Response<Full<Bytes>> {
+fn into_full(resp: Response<Bytes>) -> Response<ProxyBody> {
     let (mut parts, body) = resp.into_parts();
     strip_hop_by_hop(&mut parts.headers);
     // Body is fully buffered: let hyper set an accurate Content-Length.
     parts.headers.remove(TRANSFER_ENCODING);
     parts.headers.remove(CONTENT_LENGTH);
-    Response::from_parts(parts, Full::new(body))
+    Response::from_parts(parts, full_body(body))
 }
 
 /// A tiny plaintext response (used for proxy-level errors).
-fn simple(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+fn simple(status: StatusCode, msg: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(msg.to_owned())))
+        .body(full_body(Bytes::from(msg.to_owned())))
         .expect("static response is always valid")
 }
 

@@ -4,11 +4,56 @@ mod common;
 
 use bytes::Bytes;
 use common::*;
-use http::Request;
+use http::{Request, Response, StatusCode};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tempfile::TempDir;
+
+async fn h2_extended_connect_echo(
+    req: Request<Incoming>,
+) -> Result<Response<Incoming>, Infallible> {
+    assert_eq!(req.method(), http::Method::CONNECT);
+    let protocol = req
+        .extensions()
+        .get::<hyper::ext::Protocol>()
+        .expect(":protocol must reach the origin");
+    assert_eq!(protocol.as_str(), "websocket");
+    Ok(Response::new(req.into_body()))
+}
+
+async fn spawn_h2_extended_connect_origin() -> (std::net::SocketAddr, SelfSignedCert) {
+    let cert = self_signed_cert();
+    let mut tls_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert.cert_chain.clone(), cert.key_der())
+        .unwrap();
+    tls_cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let tls = acceptor.accept(tcp).await.unwrap();
+        let service = service_fn(h2_extended_connect_echo);
+        let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        builder.enable_connect_protocol();
+        let _ = builder
+            .serve_connection(TokioIo::new(tls), service)
+            .await;
+    });
+
+    (addr, cert)
+}
 
 /// Helper: do a CONNECT tunnel (raw TCP), then make multiple h2 requests on
 /// the same TLS connection.
@@ -180,4 +225,48 @@ async fn http2_concurrent_multiplexed_streams() {
     let (ca_pem, _handle) = start_proxy_on(tcp_addr, None, ca_dir.path(), inspectors).await;
 
     h2_multiplexed_requests(tcp_addr, &ca_pem, "localhost", origin_addr.port()).await;
+}
+
+#[tokio::test]
+async fn http2_extended_connect_preserves_protocol_and_stream_body() {
+    init_tracing();
+
+    let (origin_addr, _cert) = spawn_h2_extended_connect_origin().await;
+    let ca_dir = TempDir::new().unwrap();
+    let tcp_addr = pick_tcp_addr().await;
+    let inspectors = Inspectors::default();
+    let (ca_pem, _handle) = start_proxy_on(tcp_addr, None, ca_dir.path(), inspectors).await;
+
+    let tls = connect_tls_through_proxy(
+        tcp_addr,
+        &ca_pem,
+        "localhost",
+        origin_addr.port(),
+        vec![b"h2".to_vec()],
+    )
+    .await;
+    let (mut sender, mut connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // Give the connection task a chance to process the proxy's
+    // SETTINGS_ENABLE_CONNECT_PROTOCOL before sending :protocol.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let request = Request::builder()
+        .method(http::Method::CONNECT)
+        .version(http::Version::HTTP_2)
+        .uri("/websocket")
+        .header("host", "localhost")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Full::new(Bytes::from_static(b"extended-connect-payload")))
+        .unwrap();
+    let response = sender.send_request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"extended-connect-payload");
 }

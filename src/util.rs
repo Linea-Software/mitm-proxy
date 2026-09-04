@@ -1,10 +1,10 @@
 //! Helpers shared by the HTTP/1.x+2 and HTTP/3 request pipelines.
 
-use bytes::Bytes;
-use http::header::{HOST, HeaderMap, HeaderValue};
+
+use http::header::{CONNECTION, HOST, UPGRADE, HeaderMap, HeaderName, HeaderValue};
 use http::uri::{Authority, Scheme};
 use http::{Request, Uri, Version};
-use http_body_util::Full;
+
 
 use crate::error::Result;
 
@@ -56,7 +56,7 @@ pub fn snapshot_request_head(head: &http::request::Parts) -> http::request::Part
 
 /// Ensure a `Host` header is present (needed for HTTP/1.x upstreams; HTTP/2 and
 /// HTTP/3 carry the authority as a pseudo-header instead).
-pub fn ensure_host_header(req: &mut Request<Full<Bytes>>, host: &str, port: u16, secure: bool) {
+pub fn ensure_host_header<B>(req: &mut Request<B>, host: &str, port: u16, secure: bool) {
     if req.version() == Version::HTTP_2 || req.version() == Version::HTTP_3 {
         return;
     }
@@ -88,8 +88,21 @@ pub fn strip_port(host_port: &str) -> &str {
     }
 }
 
+fn connection_header_names(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .collect()
+}
+
 /// Remove hop-by-hop headers that must not be forwarded across a proxy.
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    for name in connection_header_names(headers) {
+        headers.remove(name);
+    }
     const HOP: &[&str] = &[
         "connection",
         "proxy-connection",
@@ -107,6 +120,36 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
     ];
     for name in HOP {
         headers.remove(*name);
+    }
+}
+
+/// Remove proxy-only hop-by-hop headers while preserving the HTTP/1.1
+/// `Connection: Upgrade` and `Upgrade` pair required to switch protocols.
+pub fn strip_hop_by_hop_for_upgrade(headers: &mut HeaderMap) {
+    for name in connection_header_names(headers) {
+        if name != UPGRADE {
+            headers.remove(name);
+        }
+    }
+
+    const HOP: &[&str] = &[
+        "proxy-connection",
+        "keep-alive",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "alt-svc",
+    ];
+    for name in HOP {
+        headers.remove(*name);
+    }
+
+    if headers.contains_key(UPGRADE) {
+        headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    } else {
+        headers.remove(CONNECTION);
     }
 }
 

@@ -1,17 +1,18 @@
 //! The transparent inspect point.
 //!
 //! After the proxy decrypts a request (and, later, its response) it hands the
-//! fully-buffered message to the caller's inspectors. An inspector may:
+//! message metadata and, when requested, a buffered body to the caller's
+//! inspectors. An inspector may:
 //!
 //! * observe the request/response,
 //! * mutate it in place (headers or body), or
 //! * short-circuit a request with a synthetic response (block / redirect).
 //!
-//! Bodies are buffered into [`Bytes`] before inspection. This keeps the hook
-//! simple and makes modification trivial, at the cost of not streaming very
-//! large payloads — an acceptable trade-off for an inspection-focused MITM
-//! (see the crate's non-goals). Websockets and other upgraded/streaming
-//! protocols are therefore not inspectable and are not currently tunnelled.
+//! Request bodies are buffered before normal request inspection. Response
+//! inspectors can choose per response whether the body must be buffered for
+//! mutation or may be streamed without aggregation. HTTP upgrades are relayed
+//! as opaque byte streams after their opening handshake.
+//!
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -72,6 +73,16 @@ pub enum ResponseAction {
     Continue,
 }
 
+/// Whether an upstream response body must be aggregated before inspection or
+/// can be forwarded frame-by-frame to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseBodyMode {
+    /// Collect the whole body, run the body inspector, then return it.
+    Buffer,
+    /// Forward body frames immediately. Only the response-head hook runs.
+    Stream,
+}
+
 /// Hook invoked for every decrypted request before it is forwarded upstream.
 #[async_trait]
 pub trait RequestInspector: Send + Sync {
@@ -83,6 +94,28 @@ pub trait RequestInspector: Send + Sync {
 /// returned to the client.
 #[async_trait]
 pub trait ResponseInspector: Send + Sync {
+    /// Inspect or mutate response metadata before its body is handled. The
+    /// response body is intentionally empty in this hook.
+    async fn inspect_response_head(
+        &self,
+        _meta: &ConnMeta,
+        _req_head: &http::request::Parts,
+        _res_head: &mut BufferedResponse,
+    ) -> ResponseAction {
+        ResponseAction::Continue
+    }
+
+    /// Select body handling for this response. Buffering remains the default
+    /// so existing third-party inspectors retain their previous semantics.
+    fn response_body_mode(
+        &self,
+        _meta: &ConnMeta,
+        _req_head: &http::request::Parts,
+        _res_head: &BufferedResponse,
+    ) -> ResponseBodyMode {
+        ResponseBodyMode::Buffer
+    }
+
     /// Inspect `res` in place.
     async fn inspect_response(
         &self,
@@ -127,6 +160,15 @@ impl RequestInspector for NoopInspector {
 
 #[async_trait]
 impl ResponseInspector for NoopInspector {
+    fn response_body_mode(
+        &self,
+        _: &ConnMeta,
+        _: &http::request::Parts,
+        _: &BufferedResponse,
+    ) -> ResponseBodyMode {
+        ResponseBodyMode::Stream
+    }
+
     async fn inspect_response(
         &self,
         _: &ConnMeta,
@@ -158,6 +200,32 @@ impl RequestInspector for LoggingInspector {
 
 #[async_trait]
 impl ResponseInspector for LoggingInspector {
+    async fn inspect_response_head(
+        &self,
+        meta: &ConnMeta,
+        req_head: &http::request::Parts,
+        res: &mut BufferedResponse,
+    ) -> ResponseAction {
+        info!(
+            proto = %meta.protocol,
+            client = %meta.client_addr,
+            "<- {} for {} {}",
+            res.status(),
+            req_head.method,
+            req_head.uri,
+        );
+        ResponseAction::Continue
+    }
+
+    fn response_body_mode(
+        &self,
+        _: &ConnMeta,
+        _: &http::request::Parts,
+        _: &BufferedResponse,
+    ) -> ResponseBodyMode {
+        ResponseBodyMode::Stream
+    }
+
     async fn inspect_response(
         &self,
         meta: &ConnMeta,

@@ -20,11 +20,11 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use http::{Request, Response, StatusCode};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use tracing::{debug, info, warn};
 
 use crate::error::Result;
-use crate::inspect::{ConnMeta, Protocol, RequestAction};
+use crate::inspect::{ConnMeta, Protocol, RequestAction, ResponseBodyMode};
 use crate::state::SharedState;
 use crate::util::{absolute_uri, ensure_host_header, snapshot_request_head, strip_hop_by_hop};
 
@@ -175,15 +175,77 @@ async fn handle_request(
         }
     };
 
-    // --- response inspect hook ------------------------------------------
-    let mut buffered_resp = upstream_resp;
+    let (parts, body) = upstream_resp.into_parts();
+    let mut response_head = Response::from_parts(parts, Bytes::new());
     state
         .inspectors
         .response
-        .inspect_response(&meta, &head_snapshot, &mut buffered_resp)
+        .inspect_response_head(&meta, &head_snapshot, &mut response_head)
         .await;
+    let body_mode = state
+        .inspectors
+        .response
+        .response_body_mode(&meta, &head_snapshot, &response_head);
+    let (parts, _) = response_head.into_parts();
 
-    send_response(&mut stream, buffered_resp).await
+    match body_mode {
+        ResponseBodyMode::Stream => {
+            send_streaming_response(&mut stream, Response::from_parts(parts, body)).await
+        }
+        ResponseBodyMode::Buffer => {
+            let body = body
+                .collect()
+                .await
+                .map_err(|e| eyre::eyre!("reading upstream h3 response body: {e}"))?
+                .to_bytes();
+            let mut buffered_resp = Response::from_parts(parts, body);
+            state
+                .inspectors
+                .response
+                .inspect_response(&meta, &head_snapshot, &mut buffered_resp)
+                .await;
+            send_response(&mut stream, buffered_resp).await
+        }
+    }
+}
+
+/// Send an upstream response over HTTP/3 without aggregating its body.
+async fn send_streaming_response(
+    stream: &mut H3Stream,
+    resp: Response<hyper::body::Incoming>,
+) -> Result<()> {
+    let (mut parts, mut body) = resp.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
+    parts.headers.remove(http::header::ALT_SVC);
+
+    let head = Response::from_parts(parts, ());
+    stream
+        .send_response(head)
+        .await
+        .map_err(|e| eyre::eyre!("sending h3 streaming response head: {e}"))?;
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| eyre::eyre!("reading upstream streaming frame: {e}"))?;
+        match frame.into_data() {
+            Ok(data) => stream
+                .send_data(data)
+                .await
+                .map_err(|e| eyre::eyre!("sending h3 streaming response data: {e}"))?,
+            Err(frame) => {
+                if let Ok(trailers) = frame.into_trailers() {
+                    stream
+                        .send_trailers(trailers)
+                        .await
+                        .map_err(|e| eyre::eyre!("sending h3 streaming response trailers: {e}"))?;
+                }
+            }
+        }
+    }
+
+    stream
+        .finish()
+        .await
+        .map_err(|e| eyre::eyre!("finishing h3 streaming response: {e}"))
 }
 
 /// Send a buffered response over an HTTP/3 request stream.
