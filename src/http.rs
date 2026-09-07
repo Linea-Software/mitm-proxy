@@ -59,6 +59,7 @@ pub async fn serve(state: SharedState) -> Result<()> {
                 continue;
             }
         };
+        debug!(client = %peer, "accepted proxy client TCP connection");
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = serve_connection(stream, peer, state).await {
@@ -96,6 +97,7 @@ async fn outer_handler(
         let Some(authority) = req.uri().authority().cloned() else {
             return simple(StatusCode::BAD_REQUEST, "CONNECT requires an authority");
         };
+        debug!(client = %peer, authority = %authority, "received CONNECT request");
 
         tokio::spawn(async move {
             match hyper::upgrade::on(req).await {
@@ -158,11 +160,19 @@ where
     // Anything else is relayed opaquely — no TLS setup runs on that branch, so
     // no leaf certificate is minted and no decryption happens. `sni` is a
     // placeholder (always `None` for now); see `InterceptDecider`.
-    if !state.intercept_decider.should_intercept(&authority, None) {
+    let should_intercept = state.intercept_decider.should_intercept(&authority, None);
+    debug!(
+        client = %peer,
+        authority = %authority,
+        should_intercept,
+        "CONNECT interception decision"
+    );
+    if !should_intercept {
         return opaque_tunnel(io, &authority, &host, port).await;
     }
 
     let acceptor = TlsAcceptor::from(state.server_tls.clone());
+    debug!(client = %peer, authority = %authority, "starting client TLS handshake");
     let tls = acceptor
         .accept(io)
         .await
@@ -173,7 +183,12 @@ where
         Some(b"h2") => Protocol::Http2,
         _ => Protocol::Http1,
     };
-    debug!("MITM {host}:{port} negotiated {protocol}");
+    debug!(
+        client = %peer,
+        authority = %authority,
+        protocol = %protocol,
+        "client TLS handshake completed"
+    );
 
     let host = Arc::new(host);
     let hyper_io = TokioIo::new(tls);
@@ -270,6 +285,18 @@ async fn relay(
     // reject SNI literals with a handshake failure. Prefer the hostname the
     // request itself carries (`:authority` for HTTP/2, `Host` for HTTP/1.x).
     let upstream_host = upstream_host_for(&req, &host).unwrap_or(host);
+    debug!(
+        client = %meta.client_addr,
+        protocol = %meta.protocol,
+        tls = meta.is_tls,
+        method = %req.method(),
+        version = ?req.version(),
+        path = %req.uri().path(),
+        authority = %meta.authority,
+        upstream_host = %upstream_host,
+        upstream_port = port,
+        "relaying request"
+    );
 
     // Rebuild an absolute target URI (origin-form requests inside a tunnel lack
     // scheme/authority; plaintext ones already have them).
@@ -307,6 +334,13 @@ async fn relay(
             );
         }
     };
+    debug!(
+        client = %meta.client_addr,
+        method = %parts.method,
+        path = %parts.uri.path(),
+        request_body_bytes = body_bytes.len(),
+        "request body buffered"
+    );
     let mut buffered = Request::from_parts(parts, body_bytes);
 
     // --- request inspect hook -------------------------------------------
@@ -468,6 +502,15 @@ async fn finish_upstream_response(
         .inspectors
         .response
         .response_body_mode(&meta, &head_snapshot, &response_head);
+    debug!(
+        client = %meta.client_addr,
+        protocol = %meta.protocol,
+        method = %head_snapshot.method,
+        path = %head_snapshot.uri.path(),
+        status = %response_head.status(),
+        body_mode = ?body_mode,
+        "upstream response ready for client"
+    );
     let (mut parts, _) = response_head.into_parts();
 
     match body_mode {

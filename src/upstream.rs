@@ -63,6 +63,17 @@ impl Upstream {
                 .flat_map(|value| value.split(','))
                 .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
 
+        debug!(
+            authority = %authority,
+            secure,
+            method = %req.method(),
+            version = ?req.version(),
+            path = %req.uri().path(),
+            requires_h2,
+            requires_h1_upgrade,
+            "opening upstream connection"
+        );
+
         let tcp = TcpStream::connect((host, port))
             .await
             .map_err(|e| ProxyError::Upstream {
@@ -70,6 +81,7 @@ impl Upstream {
                 source: eyre!("tcp connect: {e}"),
             })?;
         tcp.set_nodelay(true).ok();
+        debug!(authority = %authority, "upstream TCP connection established");
 
         if secure {
             let tls_config = if requires_h2 || requires_h1_upgrade {
@@ -86,6 +98,7 @@ impl Upstream {
             let connector = TlsConnector::from(tls_config);
             let server_name = ServerName::try_from(host.to_string())
                 .map_err(|e| eyre!("invalid upstream server name {host:?}: {e}"))?;
+            debug!(authority = %authority, server_name = %host, "starting upstream TLS handshake");
             let tls = connector
                 .connect(server_name, tcp)
                 .await
@@ -96,8 +109,9 @@ impl Upstream {
 
             let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
             debug!(
-                "upstream {authority} negotiated {}",
-                if is_h2 { "h2" } else { "http/1.1" }
+                authority = %authority,
+                alpn = if is_h2 { "h2" } else { "http/1.1" },
+                "upstream TLS handshake completed"
             );
 
             if is_h2 && requires_h1_upgrade {
@@ -154,10 +168,12 @@ impl Upstream {
             }
         });
 
-        sender
+        let response = sender
             .send_request(req)
             .await
-            .wrap_err_with(|| format!("http/1 request to {authority} failed"))
+            .wrap_err_with(|| format!("http/1 request to {authority} failed"))?;
+        debug!(authority = %authority, status = %response.status(), "upstream HTTP/1 response received");
+        Ok(response)
     }
 
     async fn send_h2<I, B>(
@@ -214,9 +230,11 @@ impl Upstream {
             }
         });
 
-        sender
+        let response = sender
             .send_request(req)
             .await
-            .wrap_err_with(|| format!("http/2 request to {authority} failed"))
+            .wrap_err_with(|| format!("http/2 request to {authority} failed"))?;
+        debug!(authority = %authority, status = %response.status(), "upstream HTTP/2 response received");
+        Ok(response)
     }
 }
