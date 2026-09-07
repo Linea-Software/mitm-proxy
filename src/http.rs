@@ -43,6 +43,11 @@ use rustls::pki_types::ServerName;
 type BoxError = Box<dyn Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 
+// Browser HTTP/2 requests can legitimately exceed Hyper's 16 KiB default once
+// cookies and client-hint headers accumulate. Keep the limit bounded while
+// leaving enough headroom for header-heavy applications such as ChatGPT.
+const CLIENT_HTTP2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+
 /// Bind and serve the HTTP/1.x + HTTP/2 forward proxy until the process exits.
 pub async fn serve(state: SharedState) -> Result<()> {
     let addr = state.config.listen_addr;
@@ -209,7 +214,10 @@ where
 
     // `auto` serves either HTTP/1.x or HTTP/2 based on the negotiated protocol.
     let mut builder = auto::Builder::new(TokioExecutor::new());
-    builder.http2().enable_connect_protocol();
+    builder
+        .http2()
+        .max_header_list_size(CLIENT_HTTP2_MAX_HEADER_LIST_SIZE)
+        .enable_connect_protocol();
     builder
         .serve_connection_with_upgrades(hyper_io, service)
         .await

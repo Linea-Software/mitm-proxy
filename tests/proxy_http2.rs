@@ -55,6 +55,31 @@ async fn spawn_h2_extended_connect_origin() -> (std::net::SocketAddr, SelfSigned
     (addr, cert)
 }
 
+async fn spawn_h2_large_header_origin() -> (std::net::SocketAddr, SelfSignedCert) {
+    let cert = self_signed_cert();
+    let mut tls_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert.cert_chain.clone(), cert.key_der())
+        .unwrap();
+    tls_cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let tls = acceptor.accept(tcp).await.unwrap();
+        let service = service_fn(|_req: Request<Incoming>| async {
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+        });
+        let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        builder.max_header_list_size(64 * 1024);
+        let _ = builder.serve_connection(TokioIo::new(tls), service).await;
+    });
+
+    (addr, cert)
+}
+
 /// Helper: do a CONNECT tunnel (raw TCP), then make multiple h2 requests on
 /// the same TLS connection.
 async fn h2_multiplexed_requests(
@@ -225,6 +250,47 @@ async fn http2_concurrent_multiplexed_streams() {
     let (ca_pem, _handle) = start_proxy_on(tcp_addr, None, ca_dir.path(), inspectors).await;
 
     h2_multiplexed_requests(tcp_addr, &ca_pem, "localhost", origin_addr.port()).await;
+}
+
+#[tokio::test]
+async fn http2_accepts_request_headers_larger_than_hyper_default() {
+    init_tracing();
+
+    let (origin_addr, _cert) = spawn_h2_large_header_origin().await;
+    let ca_dir = TempDir::new().unwrap();
+    let tcp_addr = pick_tcp_addr().await;
+    let inspectors = Inspectors::default();
+    let (ca_pem, _handle) = start_proxy_on(tcp_addr, None, ca_dir.path(), inspectors).await;
+
+    let tls = connect_tls_through_proxy(
+        tcp_addr,
+        &ca_pem,
+        "localhost",
+        origin_addr.port(),
+        vec![b"h2".to_vec()],
+    )
+    .await;
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // Hyper's server-side HTTP/2 default is currently 16 KiB. Real browser
+    // requests can exceed that once cookies and client-hint headers accumulate.
+    let large_header = "x".repeat(20 * 1024);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/large-header")
+        .header("host", "localhost")
+        .header("x-large-header", large_header)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let response = sender.send_request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
